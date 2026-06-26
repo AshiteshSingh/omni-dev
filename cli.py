@@ -1,5 +1,6 @@
 import asyncio
 import os
+import warnings
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.markdown import Markdown
@@ -7,6 +8,10 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.live import Live
 from rich.spinner import Spinner
+
+# Suppress annoying library deprecation warnings to keep the CLI clean
+warnings.filterwarnings("ignore", category=UserWarning)
+
 from agent import OmniDevAgent
 
 # Load environment variables
