@@ -9,8 +9,10 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
-# Suppress annoying library deprecation warnings to keep the CLI clean
+# Suppress annoying library deprecation warnings and verbose cognee logs
 warnings.filterwarnings("ignore", category=UserWarning)
+import logging
+logging.getLogger("cognee").setLevel(logging.CRITICAL)
 
 from src.agent.core import OmniDevAgent
 
