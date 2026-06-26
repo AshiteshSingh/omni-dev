@@ -16,7 +16,18 @@ console = Console()
 
 async def main():
     console.clear()
-    console.print(Panel.fit("[bold cyan]Omni-Dev CLI[/bold cyan]\n[italic]Your Agentic, Context-Aware Coding Assistant[/italic]", border_style="cyan"))
+    
+    # Professional ASCII Art Banner
+    ascii_banner = """[bold cyan]
+   ____  __  __ _   _ ___       ____  FV 
+  / __ \|  \/  | \ | |_ _|     |  _ \ _____   __
+ | |  | | |\/| |  \| || |_____ | | | / _ \ \ / /
+ | |__| | |  | | |\  || |_____ | |_| \ __/\ V / 
+  \____/|_|  |_|_| \_|___|     |____/ \___|\_/  
+[/bold cyan]"""
+    console.print(ascii_banner)
+    console.print("[italic cyan]   Your Context-Aware, Agentic Developer Assistant[/italic cyan]\n")
+    console.print("="*60 + "\n")
     
     # Check credentials
     if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
