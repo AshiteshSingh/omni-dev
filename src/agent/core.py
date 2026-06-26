@@ -167,6 +167,10 @@ class OmniDevAgent:
             "If a tool returns an error, analyze the error and try a different approach."
         )
         self.messages = [{"role": "system", "content": self.system_instruction}]
+        self.session_tokens = 0
+
+    def get_token_usage(self):
+        return self.session_tokens
 
     def compact_session(self):
         """Resets the short-term chat memory to save tokens while keeping long-term graph memory."""
@@ -335,6 +339,9 @@ class OmniDevAgent:
                 )
             except Exception as e:
                 return f"Error from LLM Provider: {str(e)}"
+                
+            if hasattr(response, 'usage') and response.usage:
+                self.session_tokens += getattr(response.usage, 'total_tokens', 0)
                 
             response_message = response.choices[0].message
             
