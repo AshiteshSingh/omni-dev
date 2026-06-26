@@ -4,182 +4,173 @@ import subprocess
 import asyncio
 import uuid
 import requests
-import vertexai
-from vertexai.generative_models import (
-    FunctionDeclaration,
-    GenerativeModel,
-    Part,
-    Tool,
-)
+import json
+import litellm
 import cognee
 
-# Define Function Declarations for the Agent
-read_file_func = FunctionDeclaration(
-    name="read_file",
-    description="Read the contents of a local file.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "Absolute or relative path to the file."}
-        },
-        "required": ["path"]
+# Define JSON Schema Tools for Litellm (Universal Format)
+omni_tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a local file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute or relative path to the file."}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Create a completely new file and write content to it. For existing files, you MUST use edit_file instead to save tokens.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute or relative path to the file."},
+                    "content": {"type": "string", "description": "The full text content to write."}
+                },
+                "required": ["path", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Surgically edit an existing file by replacing a specific block of text. Use this instead of write_file for existing files to save tokens.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute or relative path to the file."},
+                    "target_content": {"type": "string", "description": "The exact block of text to be replaced. Must match exactly, including whitespace."},
+                    "replacement_content": {"type": "string", "description": "The new block of text to insert in its place."}
+                },
+                "required": ["path", "target_content", "replacement_content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Execute a shell command (e.g., npm run build, ls, pytest).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The shell command to run."}
+                },
+                "required": ["command"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": "Store a fact, user preference, or project context into long-term Cognee graph memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fact": {"type": "string", "description": "The fact or context to remember."}
+                },
+                "required": ["fact"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall",
+            "description": "Search long-term Cognee graph memory for past context or facts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What you want to search for."}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "spawn_subagent",
+            "description": "Spawns a detached background sub-agent to work on a task independently. The sub-agent runs silently and uses 'remember' to save its final report to Cognee.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_description": {"type": "string", "description": "A very detailed description of what the sub-agent needs to accomplish."}
+                },
+                "required": ["task_description"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Search the internet using SearXNG. Use this to find up-to-date information, documentation, or solutions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query string."}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "think",
+            "description": "Use this tool to think out loud, reason through complex bugs, or architect a plan before taking action. Your thoughts will be saved to memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thought": {"type": "string", "description": "Your detailed reasoning or architectural plan."}
+                },
+                "required": ["thought"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_codebase",
+            "description": "Search the local codebase for a text pattern or regex (similar to grep). Use this to quickly find where functions or variables are defined without reading whole files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The regex or text pattern to search for."},
+                    "directory": {"type": "string", "description": "The directory to search in (use '.' for root)."}
+                },
+                "required": ["query", "directory"]
+            }
+        }
     }
-)
-
-write_file_func = FunctionDeclaration(
-    name="write_file",
-    description="Create a completely new file and write content to it. For existing files, you MUST use edit_file instead to save tokens.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "Absolute or relative path to the file."},
-            "content": {"type": "string", "description": "The full text content to write."}
-        },
-        "required": ["path", "content"]
-    }
-)
-
-edit_file_func = FunctionDeclaration(
-    name="edit_file",
-    description="Surgically edit an existing file by replacing a specific block of text. Use this instead of write_file for existing files to save tokens.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "Absolute or relative path to the file."},
-            "target_content": {"type": "string", "description": "The exact block of text to be replaced. Must match exactly, including whitespace."},
-            "replacement_content": {"type": "string", "description": "The new block of text to insert in its place."}
-        },
-        "required": ["path", "target_content", "replacement_content"]
-    }
-)
-
-run_command_func = FunctionDeclaration(
-    name="run_command",
-    description="Execute a shell command (e.g., npm run build, ls, pytest).",
-    parameters={
-        "type": "object",
-        "properties": {
-            "command": {"type": "string", "description": "The shell command to run."}
-        },
-        "required": ["command"]
-    }
-)
-
-remember_func = FunctionDeclaration(
-    name="remember",
-    description="Store a fact, user preference, or project context into long-term Cognee graph memory.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "fact": {"type": "string", "description": "The fact or context to remember."}
-        },
-        "required": ["fact"]
-    }
-)
-
-recall_func = FunctionDeclaration(
-    name="recall",
-    description="Search long-term Cognee graph memory for past context or facts.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "What you want to search for."}
-        },
-        "required": ["query"]
-    }
-)
-
-spawn_subagent_func = FunctionDeclaration(
-    name="spawn_subagent",
-    description="Spawns a detached background sub-agent to work on a task independently. The sub-agent runs silently and uses 'remember' to save its final report to Cognee.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "task_description": {"type": "string", "description": "A very detailed description of what the sub-agent needs to accomplish."}
-        },
-        "required": ["task_description"]
-    }
-)
-
-search_web_func = FunctionDeclaration(
-    name="search_web",
-    description="Search the internet using SearXNG. Use this to find up-to-date information, documentation, or solutions.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "The search query string."}
-        },
-        "required": ["query"]
-    }
-)
-
-think_func = FunctionDeclaration(
-    name="think",
-    description="Use this tool to think out loud, reason through complex bugs, or architect a plan before taking action. Your thoughts will be saved to memory.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "thought": {"type": "string", "description": "Your detailed reasoning or architectural plan."}
-        },
-        "required": ["thought"]
-    }
-)
-
-search_codebase_func = FunctionDeclaration(
-    name="search_codebase",
-    description="Search the local codebase for a text pattern or regex (similar to grep). Use this to quickly find where functions or variables are defined without reading whole files.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "The regex or text pattern to search for."},
-            "directory": {"type": "string", "description": "The directory to search in (use '.' for root)."}
-        },
-        "required": ["query", "directory"]
-    }
-)
-
-omni_tools = Tool(
-    function_declarations=[
-        read_file_func,
-        write_file_func,
-        edit_file_func,
-        run_command_func,
-        remember_func,
-        recall_func,
-        spawn_subagent_func,
-        search_web_func,
-        think_func,
-        search_codebase_func
-    ]
-)
+]
 
 class OmniDevAgent:
     def __init__(self):
-        self.project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-        self.location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-        if self.project_id:
-            vertexai.init(project=self.project_id, location=self.location)
+        self.model_name = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro")
         
-        self.model = GenerativeModel(
-            "gemini-1.5-pro",
-            tools=[omni_tools],
-            system_instruction=(
-                "You are Omni-Dev, a highly capable autonomous coding agent. "
-                "You have access to tools to read files, write files, run terminal commands, and use Cognee for long-term memory. "
-                "CRITICAL: NEVER guess file paths or URLs. You MUST use search_codebase or run_command('dir'/'ls') to verify a file exists before you attempt to edit or read it. "
-                "If a tool returns an error, analyze the error and try a different approach."
-            )
+        self.system_instruction = (
+            "You are Omni-Dev, a highly capable autonomous coding agent. "
+            "You have access to tools to read files, write files, run terminal commands, and use Cognee for long-term memory. "
+            "CRITICAL: NEVER guess file paths or URLs. You MUST use search_codebase or run_command('dir'/'ls') to verify a file exists before you attempt to edit or read it. "
+            "If a tool returns an error, analyze the error and try a different approach."
         )
-        self.chat_session = self.model.start_chat()
-        
-        cognee.config.set_llm_config({
-            "llm_provider": "google_vertex_ai",
-            "llm_model": "gemini-1.5-pro"
-        })
+        self.messages = [{"role": "system", "content": self.system_instruction}]
 
     def compact_session(self):
         """Resets the short-term chat memory to save tokens while keeping long-term graph memory."""
-        self.chat_session = self.model.start_chat()
+        self.messages = [{"role": "system", "content": self.system_instruction}]
 
     # --- Tool Implementations ---
     def _tool_read_file(self, path: str) -> str:
@@ -210,7 +201,6 @@ class OmniDevAgent:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(new_content)
                 
-            # Aggressive Telemetry Logging
             await cognee.add(f"Agent edited file {path}. Replaced:\n{target_content}\nWith:\n{replacement_content}", dataset_name="agent_telemetry")
             await cognee.cognify()
             
@@ -238,7 +228,6 @@ class OmniDevAgent:
             result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
             output = result.stdout + "\n" + result.stderr
             
-            # Aggressive Telemetry Logging
             await cognee.add(f"Agent ran terminal command: {command}\nOutput: {output}", dataset_name="agent_telemetry")
             await cognee.cognify()
             
@@ -268,7 +257,6 @@ class OmniDevAgent:
     def _tool_spawn_subagent(self, task_description: str) -> str:
         try:
             subagent_id = str(uuid.uuid4())[:8]
-            # Launch subagent.py in a detached process
             if os.name == 'nt':
                 CREATE_NO_WINDOW = 0x08000000
                 subprocess.Popen(
@@ -282,13 +270,12 @@ class OmniDevAgent:
                     start_new_session=True,
                     cwd=os.path.abspath(os.path.dirname(__file__))
                 )
-            return f"Sub-agent '{subagent_id}' spawned successfully in the background. It will save its findings to memory when finished. You do not need to wait for it."
+            return f"Sub-agent '{subagent_id}' spawned successfully in the background. It will save its findings to memory when finished."
         except Exception as e:
             return f"Error spawning subagent: {e}"
 
     def _tool_search_web(self, query: str) -> str:
         try:
-            # Using a public SearXNG instance or one defined in env
             searxng_url = os.environ.get("SEARXNG_URL", "https://searx.be")
             response = requests.get(
                 f"{searxng_url}/search",
@@ -299,7 +286,6 @@ class OmniDevAgent:
                 results = response.json().get("results", [])
                 if not results:
                     return "No results found."
-                # Format the top 5 results
                 formatted = [f"Title: {r.get('title')}\nURL: {r.get('url')}\nContent: {r.get('content')}" for r in results[:5]]
                 return "\n\n".join(formatted)
             else:
@@ -334,20 +320,35 @@ class OmniDevAgent:
             return f"Error searching codebase: {e}"
 
     async def execute_task(self, prompt: str, progress_callback=None):
-        """
-        Sends the prompt to Gemini and automatically handles tool calls in a loop
-        until Gemini returns a final text response.
-        """
-        response = self.chat_session.send_message(prompt)
+        self.messages.append({"role": "user", "content": prompt})
+        
+        # Always fetch latest model in case user hot-swapped it
+        model_name = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro")
         
         while True:
-            # Check if Gemini wants to call a tool
-            if response.function_calls:
-                function_responses = []
-                for function_call in response.function_calls:
-                    func_name = function_call.name
-                    args = {key: val for key, val in function_call.args.items()}
-                    
+            try:
+                response = litellm.completion(
+                    model=model_name,
+                    messages=self.messages,
+                    tools=omni_tools,
+                    tool_choice="auto"
+                )
+            except Exception as e:
+                return f"Error from LLM Provider: {str(e)}"
+                
+            response_message = response.choices[0].message
+            
+            if response_message.tool_calls:
+                # Store assistant tool call request
+                self.messages.append(response_message.model_dump())
+                
+                for tool_call in response_message.tool_calls:
+                    func_name = tool_call.function.name
+                    try:
+                        args = json.loads(tool_call.function.arguments)
+                    except:
+                        args = {}
+                        
                     if progress_callback:
                         progress_callback(func_name, args)
 
@@ -375,18 +376,13 @@ class OmniDevAgent:
                     else:
                         result = f"Unknown tool: {func_name}"
 
-                    # Package the result to send back to Gemini
-                    function_responses.append(
-                        Part.from_function_response(
-                            name=func_name,
-                            response={"content": result}
-                        )
-                    )
-                
-                # Send tool results back to the model
-                response = self.chat_session.send_message(function_responses)
+                    self.messages.append({
+                        "role": "tool",
+                        "name": func_name,
+                        "tool_call_id": tool_call.id,
+                        "content": str(result)
+                    })
             else:
-                # No more function calls, we have a final text response
-                break
-                
-        return response.text
+                final_text = response_message.content or ""
+                self.messages.append({"role": "assistant", "content": final_text})
+                return final_text

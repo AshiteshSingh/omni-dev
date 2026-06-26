@@ -62,6 +62,8 @@ async def main():
                 table.add_column("Command", style="bold green")
                 table.add_column("Description", style="white")
                 table.add_row("/help", "Show this help menu")
+                table.add_row("/model <name>", "Switch LLM provider (e.g., gpt-4o, ollama/llama3)")
+                table.add_row("/api_key <provider> <key>", "Add an API key securely (e.g., /api_key OPENAI sk-...)")
                 table.add_row("/clear", "Clear the terminal screen")
                 table.add_row("/index", "Aggressively crawl codebase and push architecture into Graph Memory")
                 table.add_row("/compact", "Reset short-term memory to save tokens (keeps long-term graph memory)")
@@ -72,6 +74,29 @@ async def main():
             if cmd == "/clear":
                 import os
                 os.system('cls' if os.name == 'nt' else 'clear')
+                continue
+                
+            if cmd.startswith("/model "):
+                new_model = cmd.split(" ", 1)[1].strip()
+                os.environ["OMNI_MODEL"] = new_model
+                from dotenv import set_key
+                set_key('.env', 'OMNI_MODEL', new_model)
+                console.print(f"[bold green]✅ LLM engine hot-swapped to:[/bold green] {new_model}")
+                continue
+                
+            if cmd.startswith("/api_key "):
+                parts = cmd.split(" ", 2)
+                if len(parts) == 3:
+                    provider_key = parts[1].strip().upper()
+                    if not provider_key.endswith("_API_KEY"):
+                        provider_key += "_API_KEY"
+                    key_value = parts[2].strip()
+                    os.environ[provider_key] = key_value
+                    from dotenv import set_key
+                    set_key('.env', provider_key, key_value)
+                    console.print(f"[bold green]✅ API Key saved for:[/bold green] {provider_key}")
+                else:
+                    console.print("[red]Usage: /api_key <PROVIDER> <key>[/red] (e.g. /api_key OPENAI sk-...)")
                 continue
                 
             if cmd == "/index":
