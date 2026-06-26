@@ -1,0 +1,6 @@
+cognee
+google-cloud-aiplatform
+python-dotenv
+asyncio
+fastapi
+uvicorn
