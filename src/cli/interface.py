@@ -132,7 +132,7 @@ async def main():
                     console.print("\n[bold cyan]Select an LLM Provider/Model:[/bold cyan]")
                     console.print("1. OpenAI (gpt-4o)")
                     console.print("2. Anthropic (claude-3-5-sonnet-20240620)")
-                    console.print("3. Groq (groq/llama-3.3-70b-versatile)")
+                    console.print("3. Groq (groq/llama3-70b-8192)")
                     console.print("4. Google (gemini/gemini-1.5-pro)")
                     console.print("5. Local Ollama (ollama/llama3)")
                     console.print("6. Custom Model String")
@@ -142,7 +142,7 @@ async def main():
                     model_map = {
                         1: "gpt-4o", 
                         2: "claude-3-5-sonnet-20240620", 
-                        3: "groq/llama-3.3-70b-versatile", 
+                        3: "groq/llama3-70b-8192", 
                         4: "gemini/gemini-1.5-pro",
                         5: "ollama/llama3"
                     }
