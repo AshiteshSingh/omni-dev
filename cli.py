@@ -107,6 +107,8 @@ async def main():
                     console.print(f"[dim]Reading file: {args.get('path')}[/dim]")
                 elif func_name == "write_file":
                     console.print(f"[dim]Writing file: {args.get('path')}[/dim]")
+                elif func_name == "edit_file":
+                    console.print(f"[dim]Editing file (Smart Chunk Replace): {args.get('path')}[/dim]")
                 elif func_name == "run_command":
                     console.print(f"[bold yellow]Executing command:[/bold yellow] {args.get('command')}")
                 elif func_name == "remember":

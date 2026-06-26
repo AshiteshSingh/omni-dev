@@ -28,7 +28,7 @@ read_file_func = FunctionDeclaration(
 
 write_file_func = FunctionDeclaration(
     name="write_file",
-    description="Write or overwrite content to a local file.",
+    description="Create a completely new file and write content to it. For existing files, you MUST use edit_file instead to save tokens.",
     parameters={
         "type": "object",
         "properties": {
@@ -36,6 +36,20 @@ write_file_func = FunctionDeclaration(
             "content": {"type": "string", "description": "The full text content to write."}
         },
         "required": ["path", "content"]
+    }
+)
+
+edit_file_func = FunctionDeclaration(
+    name="edit_file",
+    description="Surgically edit an existing file by replacing a specific block of text. Use this instead of write_file for existing files to save tokens.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Absolute or relative path to the file."},
+            "target_content": {"type": "string", "description": "The exact block of text to be replaced. Must match exactly, including whitespace."},
+            "replacement_content": {"type": "string", "description": "The new block of text to insert in its place."}
+        },
+        "required": ["path", "target_content", "replacement_content"]
     }
 )
 
@@ -128,6 +142,7 @@ omni_tools = Tool(
     function_declarations=[
         read_file_func,
         write_file_func,
+        edit_file_func,
         run_command_func,
         remember_func,
         recall_func,
@@ -182,6 +197,21 @@ class OmniDevAgent:
             return f"Successfully wrote to {path}"
         except Exception as e:
             return f"Error writing file: {e}"
+
+    def _tool_edit_file(self, path: str, target_content: str, replacement_content: str) -> str:
+        try:
+            if not os.path.exists(path):
+                return f"Error: File {path} does not exist. Use write_file to create it."
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            if target_content not in content:
+                return "Error: target_content not found in file. Make sure your indentation and line breaks match exactly."
+            new_content = content.replace(target_content, replacement_content, 1)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+            return f"Successfully edited {path} using smart chunk replacement."
+        except Exception as e:
+            return f"Error editing file: {e}"
 
     def _tool_run_command(self, command: str) -> str:
         SAFE_COMMANDS = ["git status", "git diff", "git log", "git branch", "dir", "ls", "pwd", "tree", "date", "whoami", "npm run dev"]
@@ -316,6 +346,8 @@ class OmniDevAgent:
                         result = self._tool_read_file(**args)
                     elif func_name == "write_file":
                         result = self._tool_write_file(**args)
+                    elif func_name == "edit_file":
+                        result = self._tool_edit_file(**args)
                     elif func_name == "run_command":
                         result = self._tool_run_command(**args)
                     elif func_name == "remember":
