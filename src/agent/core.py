@@ -340,10 +340,10 @@ class OmniDevAgent:
             except Exception as e:
                 error_msg = str(e)
                 if "403" in error_msg or "Permission" in error_msg:
-                    return f"🚨 **API Error:** Permission denied for `{model_name}`. Did you forget to configure your model? Try typing `/model ollama/llama3` or `/model groq/llama3-8192`.\n\n*Raw Error:* {error_msg[:150]}..."
-                elif "API" in error_msg or "Auth" in error_msg or "key" in error_msg.lower():
-                    return f"🚨 **API Key Missing:** The model `{model_name}` requires an API key. Please set it using `/api_key <PROVIDER> <key>` (e.g. `/api_key GROQ gsk_...`)."
-                return f"🚨 **LLM Provider Error:** {error_msg}\nEnsure you have configured your model correctly using `/model <name>`."
+                    return f"🚨 **API Error:** Permission denied for `{model_name}`. Did you forget to configure your model? Try typing `/model ollama/llama3` or `/model groq/llama3-8192`.\n\n*Raw Error:* {error_msg}"
+                elif "Auth" in error_msg or "key" in error_msg.lower() or "401" in error_msg:
+                    return f"🚨 **API Key Missing/Invalid:** The model `{model_name}` rejected the API key. Please set it using `/api_key <PROVIDER> <key>` (e.g. `/api_key GROQ gsk_...`).\n\n*Raw Error:* {error_msg}"
+                return f"🚨 **LLM Provider Error:** {error_msg}\n\n*Hint:* Ensure you have configured your model correctly using `/model <name>`. If using Groq, ensure the model exists (e.g., `groq/llama3-8192`, not qwen)."
                 
             if hasattr(response, 'usage') and response.usage:
                 self.session_tokens += getattr(response.usage, 'total_tokens', 0)

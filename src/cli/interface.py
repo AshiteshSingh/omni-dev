@@ -123,27 +123,75 @@ async def main():
                 console.print("[bold green]✅ Commit executed.[/bold green]")
                 continue
 
-            if cmd.startswith("/model "):
-                new_model = cmd.split(" ", 1)[1].strip()
-                os.environ["OMNI_MODEL"] = new_model
-                from dotenv import set_key
-                set_key('.env', 'OMNI_MODEL', new_model)
-                console.print(f"[bold green]✅ LLM engine hot-swapped to:[/bold green] {new_model}")
+            if cmd.startswith("/model"):
+                parts = user_input.strip().split(" ", 1)
+                if len(parts) == 2:
+                    new_model = parts[1].strip()
+                else:
+                    # Interactive Mode
+                    console.print("\n[bold cyan]Select an LLM Provider/Model:[/bold cyan]")
+                    console.print("1. OpenAI (gpt-4o)")
+                    console.print("2. Anthropic (claude-3-5-sonnet-20240620)")
+                    console.print("3. Groq (groq/llama-3.3-70b-versatile)")
+                    console.print("4. Google (gemini/gemini-1.5-pro)")
+                    console.print("5. Local Ollama (ollama/llama3)")
+                    console.print("6. Custom Model String")
+                    from rich.prompt import IntPrompt
+                    choice = IntPrompt.ask("Enter choice", choices=["1", "2", "3", "4", "5", "6"], show_choices=False)
+                    
+                    model_map = {
+                        1: "gpt-4o", 
+                        2: "claude-3-5-sonnet-20240620", 
+                        3: "groq/llama-3.3-70b-versatile", 
+                        4: "gemini/gemini-1.5-pro",
+                        5: "ollama/llama3"
+                    }
+                    if int(choice) in model_map:
+                        new_model = model_map[int(choice)]
+                    else:
+                        new_model = Prompt.ask("[italic]Enter exact litellm model string (e.g. groq/qwen-2.5-32b)[/italic]").strip()
+
+                if new_model:
+                    os.environ["OMNI_MODEL"] = new_model
+                    from dotenv import set_key
+                    set_key('.env', 'OMNI_MODEL', new_model)
+                    console.print(f"[bold green]✅ LLM engine hot-swapped to:[/bold green] {new_model}")
                 continue
                 
-            if cmd.startswith("/api_key "):
-                parts = cmd.split(" ", 2)
+            if cmd.startswith("/api_key"):
+                # If they passed it inline, e.g., /api_key GROQ sk-...
+                parts = user_input.strip().split(" ", 2)
                 if len(parts) == 3:
                     provider_key = parts[1].strip().upper()
                     if not provider_key.endswith("_API_KEY"):
                         provider_key += "_API_KEY"
                     key_value = parts[2].strip()
+                else:
+                    # Interactive Mode
+                    console.print("\n[bold cyan]Select an API Provider:[/bold cyan]")
+                    console.print("1. OpenAI (OPENAI_API_KEY)")
+                    console.print("2. Anthropic (ANTHROPIC_API_KEY)")
+                    console.print("3. Groq (GROQ_API_KEY)")
+                    console.print("4. Google Gemini / Vertex (GEMINI_API_KEY)")
+                    console.print("5. Custom Provider")
+                    from rich.prompt import IntPrompt
+                    choice = IntPrompt.ask("Enter choice", choices=["1", "2", "3", "4", "5"], show_choices=False)
+                    
+                    provider_map = {1: "OPENAI_API_KEY", 2: "ANTHROPIC_API_KEY", 3: "GROQ_API_KEY", 4: "GEMINI_API_KEY"}
+                    if int(choice) in provider_map:
+                        provider_key = provider_map[int(choice)]
+                    else:
+                        provider_key = Prompt.ask("[italic]Enter Custom Provider Prefix (e.g. OLLAMA)[/italic]").strip().upper()
+                        if not provider_key.endswith("_API_KEY"):
+                            provider_key += "_API_KEY"
+                            
+                    key_value = Prompt.ask(f"[italic]Enter your {provider_key}[/italic]", password=True).strip()
+
+                if key_value:
                     os.environ[provider_key] = key_value
                     from dotenv import set_key
                     set_key('.env', provider_key, key_value)
-                    console.print(f"[bold green]✅ API Key saved for:[/bold green] {provider_key}")
-                else:
-                    console.print("[red]Usage: /api_key <PROVIDER> <key>[/red] (e.g. /api_key OPENAI sk-...)")
+                    console.print(f"[bold green]✅ API Key securely saved for:[/bold green] {provider_key}")
                 continue
                 
             if cmd == "/index":
