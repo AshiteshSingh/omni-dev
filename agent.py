@@ -148,7 +148,12 @@ class OmniDevAgent:
         self.model = GenerativeModel(
             "gemini-1.5-pro",
             tools=[omni_tools],
-            system_instruction="You are Omni-Dev, a highly capable autonomous coding agent. You have access to tools to read files, write files, run terminal commands, and use Cognee for long-term memory. Use tools to solve the user's task."
+            system_instruction=(
+                "You are Omni-Dev, a highly capable autonomous coding agent. "
+                "You have access to tools to read files, write files, run terminal commands, and use Cognee for long-term memory. "
+                "CRITICAL: NEVER guess file paths or URLs. You MUST use search_codebase or run_command('dir'/'ls') to verify a file exists before you attempt to edit or read it. "
+                "If a tool returns an error, analyze the error and try a different approach."
+            )
         )
         self.chat_session = self.model.start_chat()
         
@@ -156,6 +161,10 @@ class OmniDevAgent:
             "llm_provider": "google_vertex_ai",
             "llm_model": "gemini-1.5-pro"
         })
+
+    def compact_session(self):
+        """Resets the short-term chat memory to save tokens while keeping long-term graph memory."""
+        self.chat_session = self.model.start_chat()
 
     # --- Tool Implementations ---
     def _tool_read_file(self, path: str) -> str:

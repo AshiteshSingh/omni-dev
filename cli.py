@@ -50,12 +50,35 @@ async def main():
     while True:
         try:
             user_input = Prompt.ask("[bold cyan]You[/bold cyan]")
+            cmd = user_input.strip().lower()
             
-            if user_input.strip().lower() in ["exit", "quit"]:
+            if cmd in ["exit", "quit"]:
                 console.print("[italic]Shutting down Omni-Dev...[/italic]")
                 break
+
+            if cmd == "/help":
+                from rich.table import Table
+                table = Table(title="Omni-Dev Commands", border_style="cyan")
+                table.add_column("Command", style="bold green")
+                table.add_column("Description", style="white")
+                table.add_row("/help", "Show this help menu")
+                table.add_row("/clear", "Clear the terminal screen")
+                table.add_row("/compact", "Reset short-term memory to save tokens (keeps long-term graph memory)")
+                table.add_row("/memory", "Manually query the Cognee Knowledge Graph")
+                console.print(table)
+                continue
+
+            if cmd == "/clear":
+                import os
+                os.system('cls' if os.name == 'nt' else 'clear')
+                continue
                 
-            if user_input.strip().lower() == "/memory":
+            if cmd == "/compact":
+                agent.compact_session()
+                console.print("[bold green]✅ Short-term session memory compacted! Token count reset.[/bold green]")
+                continue
+
+            if cmd == "/memory":
                 query = Prompt.ask("[italic]What memory do you want to recall from the Knowledge Graph?[/italic]")
                 with console.status("[bold magenta]Querying Cognee Graph Database for Long-Term Memory...") as status:
                     import cognee
