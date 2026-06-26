@@ -1,6 +1,8 @@
 import os
+import sys
 import subprocess
 import asyncio
+import uuid
 import vertexai
 from vertexai.generative_models import (
     FunctionDeclaration,
@@ -72,13 +74,26 @@ recall_func = FunctionDeclaration(
     }
 )
 
+spawn_subagent_func = FunctionDeclaration(
+    name="spawn_subagent",
+    description="Spawns a detached background sub-agent to work on a task independently. The sub-agent runs silently and uses 'remember' to save its final report to Cognee.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "task_description": {"type": "string", "description": "A very detailed description of what the sub-agent needs to accomplish."}
+        },
+        "required": ["task_description"]
+    }
+)
+
 omni_tools = Tool(
     function_declarations=[
         read_file_func,
         write_file_func,
         run_command_func,
         remember_func,
-        recall_func
+        recall_func,
+        spawn_subagent_func
     ]
 )
 
@@ -146,6 +161,27 @@ class OmniDevAgent:
         except Exception as e:
             return f"Error recalling memory: {e}"
 
+    def _tool_spawn_subagent(self, task_description: str) -> str:
+        try:
+            subagent_id = str(uuid.uuid4())[:8]
+            # Launch subagent.py in a detached process
+            if os.name == 'nt':
+                CREATE_NO_WINDOW = 0x08000000
+                subprocess.Popen(
+                    [sys.executable, "subagent.py", task_description, subagent_id],
+                    creationflags=CREATE_NO_WINDOW,
+                    cwd=os.path.abspath(os.path.dirname(__file__))
+                )
+            else:
+                subprocess.Popen(
+                    [sys.executable, "subagent.py", task_description, subagent_id],
+                    start_new_session=True,
+                    cwd=os.path.abspath(os.path.dirname(__file__))
+                )
+            return f"Sub-agent '{subagent_id}' spawned successfully in the background. It will save its findings to memory when finished. You do not need to wait for it."
+        except Exception as e:
+            return f"Error spawning subagent: {e}"
+
     async def execute_task(self, prompt: str, progress_callback=None):
         """
         Sends the prompt to Gemini and automatically handles tool calls in a loop
@@ -175,6 +211,8 @@ class OmniDevAgent:
                         result = await self._tool_remember(**args)
                     elif func_name == "recall":
                         result = await self._tool_recall(**args)
+                    elif func_name == "spawn_subagent":
+                        result = self._tool_spawn_subagent(**args)
                     else:
                         result = f"Unknown tool: {func_name}"
 
