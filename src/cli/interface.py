@@ -12,7 +12,7 @@ from rich.spinner import Spinner
 # Suppress annoying library deprecation warnings to keep the CLI clean
 warnings.filterwarnings("ignore", category=UserWarning)
 
-from agent import OmniDevAgent
+from src.agent.core import OmniDevAgent
 
 # Load environment variables
 load_dotenv()
