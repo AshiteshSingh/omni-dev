@@ -15,6 +15,7 @@ from .architect_tool import ArchitectTool
 from .agent_tool import AgentSubTool
 from .memory_tools import MemoryReadTool, MemoryWriteTool
 from .web_search_tool import WebSearchTool
+from .browser_tool import BrowserTool
 
 __all__ = [
     "BashTool",
@@ -32,6 +33,7 @@ __all__ = [
     "MemoryReadTool",
     "MemoryWriteTool",
     "WebSearchTool",
+    "BrowserTool",
 ]
 
 def get_all_tools():
@@ -52,6 +54,7 @@ def get_all_tools():
         MemoryReadTool(),
         MemoryWriteTool(),
         WebSearchTool(),
+        BrowserTool(),
     ]
 
 def get_json_schemas():

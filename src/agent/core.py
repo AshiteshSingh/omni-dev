@@ -53,7 +53,8 @@ SYSTEM_INSTRUCTION = (
     "5. Use remember to save important findings for future sessions.\n"
     "6. Use spawn_subagent for long background tasks.\n"
     "7. Analyze errors and try alternative approaches instead of giving up.\n"
-    "8. Use architect to plan large features before implementing them."
+    "8. Use architect to plan large features before implementing them.\n"
+    "9. Use browser_action to control a real web browser (open URL, click, type, scroll, screenshot like a human)."
 )
 
 

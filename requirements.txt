@@ -14,8 +14,9 @@ python-dotenv
 rich
 prompt_toolkit
 
-# HTTP requests (web search)
+# HTTP requests & Browser automation
 requests
+playwright
 
 # Async support
 asyncio
