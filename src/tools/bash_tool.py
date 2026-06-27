@@ -146,7 +146,7 @@ class BashTool(BaseTool):
         timeout = min(timeout, 600)
 
         # 3. If not safe, request user approval
-        if not is_command_safe(command):
+        if not is_command_safe(command) and os.environ.get("OMNI_AUTONOMOUS", "").lower() != "true":
             print(f"\n\033[91m[SECURITY] Agent wants to run:\033[0m {command}")
             try:
                 approval = input("\033[93mAllow? (y/n): \033[0m").strip().lower()

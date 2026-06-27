@@ -188,34 +188,56 @@ class OmniDevAgent:
 
         # Always use latest model in case user hot-swapped it
         model_name = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro").strip()
-        if model_name and "/" not in model_name:
-            lower_m = model_name.lower()
-            if any(k in lower_m for k in ["llama", "mixtral", "gemma", "deepseek", "whisper"]):
-                model_name = "groq/" + model_name
-            elif "gpt" in lower_m or "o1" in lower_m or "o3" in lower_m:
-                model_name = "openai/" + model_name
-            elif "claude" in lower_m:
-                model_name = "anthropic/" + model_name
-            elif "gemini" in lower_m:
-                model_name = "gemini/" + model_name
+        if model_name:
+            if model_name.lower().startswith("model "):
+                model_name = model_name[6:].strip()
+            elif model_name.lower().startswith("models/"):
+                model_name = model_name[7:].strip()
+            elif model_name.lower().startswith("ollama "):
+                model_name = "ollama/" + model_name[7:].strip()
+
+            known_providers = ("groq/", "openai/", "anthropic/", "gemini/", "vertex_ai/", "openrouter/", "ollama/", "mistral/", "deepseek/", "huggingface/", "azure/", "cohere/")
+            if not any(model_name.lower().startswith(p) for p in known_providers):
+                lower_m = model_name.lower()
+                if "/" in model_name:
+                    model_name = "openrouter/" + model_name
+                elif "oss" in lower_m or any(k in lower_m for k in ["llama", "mixtral", "gemma", "whisper"]):
+                    model_name = "groq/" + model_name
+                elif "gpt" in lower_m or "o1" in lower_m or "o3" in lower_m:
+                    model_name = "openai/" + model_name
+                elif "claude" in lower_m:
+                    model_name = "anthropic/" + model_name
+                elif "gemini" in lower_m:
+                    model_name = "gemini/" + model_name
+                elif any(k in lower_m for k in ["glm", "qwen", "deepseek", "phi", "yi"]):
+                    model_name = "openrouter/" + model_name
+
+        completion_kwargs = {
+            "model": model_name,
+            "messages": self.messages,
+            "tools": self._tool_schemas,
+            "tool_choice": "auto",
+        }
+        if model_name.startswith("ollama/"):
+            api_base = os.environ.get("OLLAMA_API_BASE")
+            if not api_base and (os.environ.get("OLLAMA_API_KEY") or ":cloud" in model_name or "-cloud" in model_name or "cloud" in model_name.lower()):
+                api_base = "https://ollama.com"
+                os.environ["OLLAMA_API_BASE"] = api_base
+            if api_base:
+                completion_kwargs["api_base"] = api_base
 
         # Agentic loop (mirrors while(true) in query.ts)
         while True:
             start_time = time.time()
             try:
                 try:
-                    response = litellm.completion(
-                        model=model_name,
-                        messages=self.messages,
-                        tools=self._tool_schemas,
-                        tool_choice="auto",
-                    )
+                    response = litellm.completion(**completion_kwargs)
                 except litellm.exceptions.BadRequestError:
                     # Fallback: try without tools (some models reject tool schemas)
-                    response = litellm.completion(
-                        model=model_name,
-                        messages=self.messages,
-                    )
+                    fallback_kwargs = dict(completion_kwargs)
+                    fallback_kwargs.pop("tools", None)
+                    fallback_kwargs.pop("tool_choice", None)
+                    response = litellm.completion(**fallback_kwargs)
                     text = response.choices[0].message.content or ""
                     return (
                         f"*(Warning: `{model_name}` rejected the tool schema. "
@@ -243,18 +265,83 @@ class OmniDevAgent:
                 )
 
             response_message = response.choices[0].message
+            tool_calls = response_message.tool_calls
+
+            # Fallback parser for open-source/cloud models that output tool calls as text inside content
+            if not tool_calls and response_message.content:
+                content_str = response_message.content.strip()
+                if any(k in content_str for k in ["Tool Calls:", '"name":', '"function":', '```json']):
+                    from types import SimpleNamespace
+                    import re, uuid
+                    valid_tools = set(self._tool_instances.keys())
+                    
+                    def repair_json_string(s: str) -> str:
+                        def escape_match(match):
+                            text = match.group(0)
+                            if re.match(r'^\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})', text):
+                                return text
+                            return '\\\\' + text[1:]
+                        s_repaired = re.sub(r'\\.', escape_match, s)
+                        s_repaired = re.sub(r'\\$', r'\\\\', s_repaired)
+                        return s_repaired
+
+                    extracted = []
+                    blocks = []
+                    if "Tool Calls:" in content_str:
+                        parts = content_str.split("Tool Calls:", 1)[1].strip()
+                        idx = parts.find("[")
+                        if idx != -1:
+                            blocks.append(parts[idx:])
+                    for match in re.finditer(r'```(?:json)?\s*([\[\{].*?[\]\}])\s*```', content_str, re.DOTALL):
+                        blocks.append(match.group(1))
+                    idx_arr = content_str.find("[")
+                    if idx_arr != -1 and "]" in content_str:
+                        blocks.append(content_str[idx_arr:content_str.rfind("]")+1])
+                    idx_obj = content_str.find("{")
+                    if idx_obj != -1 and "}" in content_str:
+                        blocks.append(content_str[idx_obj:content_str.rfind("}")+1])
+
+                    for b in blocks:
+                        try:
+                            repaired_b = repair_json_string(b)
+                            data = json.loads(repaired_b, strict=False)
+                            items = data if isinstance(data, list) else [data]
+                            for item in items:
+                                if isinstance(item, dict):
+                                    fn = item.get("function", item)
+                                    name = fn.get("name")
+                                    args = fn.get("arguments", {})
+                                    if name in valid_tools:
+                                        if isinstance(args, dict):
+                                            args = json.dumps(args)
+                                        call_id = item.get("id", f"call_{uuid.uuid4().hex[:8]}")
+                                        extracted.append(SimpleNamespace(
+                                            id=call_id,
+                                            function=SimpleNamespace(name=name, arguments=args)
+                                        ))
+                        except Exception:
+                            continue
+                    if extracted:
+                        tool_calls = extracted
 
             # Handle tool calls
-            if response_message.tool_calls:
+            if tool_calls:
                 # Store assistant's tool call message
-                self.messages.append(response_message.model_dump())
-
-                tool_calls = response_message.tool_calls
+                if response_message.tool_calls:
+                    self.messages.append(response_message.model_dump())
+                else:
+                    tc_dicts = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                        }
+                        for tc in tool_calls
+                    ]
+                    self.messages.append({"role": "assistant", "content": None, "tool_calls": tc_dicts})
 
                 # Run read-only tools concurrently, others serially
-                # Mirrors query.ts runToolsConcurrently / runToolsSerially
                 if self._all_read_only(tool_calls):
-                    # Announce all tools at once (for concurrent mode)
                     if progress_callback:
                         for tc in tool_calls:
                             try:

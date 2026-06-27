@@ -38,6 +38,89 @@ logging.getLogger("cognee").setLevel(logging.CRITICAL)
 from src.agent.core import OmniDevAgent
 
 load_dotenv()
+if not os.environ.get("OLLAMA_API_BASE") and os.environ.get("OLLAMA_API_KEY"):
+    os.environ["OLLAMA_API_BASE"] = "https://ollama.com"
+
+def sync_cognee_config():
+    """Sync configuration dynamically into Cognee based on OMNI_MODEL and env vars."""
+    try:
+        import os
+        import cognee
+        
+        model_name = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro").strip()
+        provider = "openai"
+        model = "gpt-4o"
+        api_key = ""
+        endpoint = None
+        
+        if "/" in model_name:
+            parts = model_name.split("/", 1)
+            prov_prefix = parts[0].lower()
+            model_part = parts[1]
+            
+            if prov_prefix == "groq":
+                provider = "groq"
+                model = model_part
+                api_key = os.environ.get("GROQ_API_KEY", "")
+            elif prov_prefix == "openai":
+                provider = "openai"
+                model = model_part
+                api_key = os.environ.get("OPENAI_API_KEY", "")
+            elif prov_prefix == "anthropic":
+                provider = "anthropic"
+                model = model_part
+                api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            elif prov_prefix in ("gemini", "vertex_ai"):
+                provider = "google_gemini"
+                model = model_part
+                api_key = os.environ.get("GEMINI_API_KEY", "")
+            elif prov_prefix == "openrouter":
+                provider = "openrouter"
+                model = model_part
+                api_key = os.environ.get("OPENROUTER_API_KEY", "")
+            elif prov_prefix == "ollama":
+                provider = "ollama"
+                model = model_part
+                api_key = os.environ.get("OLLAMA_API_KEY", "")
+                endpoint = os.environ.get("OLLAMA_API_BASE")
+            elif prov_prefix == "mistral":
+                provider = "mistral"
+                model = model_part
+                api_key = os.environ.get("MISTRAL_API_KEY", "")
+        else:
+            lower_m = model_name.lower()
+            if "gpt" in lower_m or "o1" in lower_m or "o3" in lower_m:
+                provider = "openai"
+                model = model_name
+                api_key = os.environ.get("OPENAI_API_KEY", "")
+            elif "claude" in lower_m:
+                provider = "anthropic"
+                model = model_name
+                api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            elif "gemini" in lower_m:
+                provider = "google_gemini"
+                model = model_name
+                api_key = os.environ.get("GEMINI_API_KEY", "")
+
+        cognee.config.set_llm_provider(provider)
+        cognee.config.set_llm_model(model)
+        if api_key:
+            cognee.config.set_llm_api_key(api_key)
+        if endpoint:
+            cognee.config.set_llm_endpoint(endpoint)
+            
+        # Set default Embeddings to local fastembed to ensure it works for free if OpenAI key is not available
+        if provider == "ollama":
+            cognee.config.set_embedding_provider("ollama")
+            cognee.config.set_embedding_model("nomic-embed-text")
+        else:
+            if not os.environ.get("OPENAI_API_KEY"):
+                cognee.config.set_embedding_provider("fastembed")
+            else:
+                cognee.config.set_embedding_provider("openai")
+                cognee.config.set_embedding_api_key(os.environ["OPENAI_API_KEY"])
+    except Exception:
+        pass
 
 # Rich Console: force_terminal bypasses Windows legacy renderer
 console = Console(
@@ -73,6 +156,7 @@ async def main():
     with console.status("[bold green]Initializing Omni-Dev and loading memories..."):
         try:
             agent = OmniDevAgent()
+            sync_cognee_config()
         except Exception as e:
             console.print(f"[bold red]Failed to initialize agent:[/bold red] {e}")
             return
@@ -89,7 +173,7 @@ async def main():
         commands_list = [
             "/help", "/tokens", "/cost", "/model", "/api_key", "/init", "/doctor",
             "/review", "/ctx_viz", "/config", "/compact", "/memory", "/index",
-            "/history", "/commit", "/pwd", "/ls", "/clear", "exit", "quit", "?"
+            "/history", "/commit", "/pwd", "/ls", "/clear", "/autonomous", "exit", "quit", "?"
         ]
 
         class SlashCommandCompleter(Completer):
@@ -117,7 +201,9 @@ async def main():
             from src.cost_tracker import get_tracker
             tok = get_tracker().total_tokens
             cost = get_tracker().total_cost_usd
-            return HTML(f'<b>? for shortcuts</b> <style color="#555555">|</style> Type <b>/</b> to complete <style color="#555555">|</style> Model: <style color="yellow"><b>{model}</b></style> <style color="#555555">|</style> <style color="magenta"><b>{tok:,} tok (${cost:.4f})</b></style>')
+            auto_mode = os.environ.get("OMNI_AUTONOMOUS", "false").lower() == "true"
+            auto_str = ' <style color="#ff3333"><b>[AUTONOMOUS]</b></style>' if auto_mode else ''
+            return HTML(f'<b>? for shortcuts</b> <style color="#555555">|</style> Type <b>/</b> to complete <style color="#555555">|</style> Model: <style color="yellow"><b>{model}</b></style>{auto_str} <style color="#555555">|</style> <style color="magenta"><b>{tok:,} tok (${cost:.4f})</b></style>')
 
         session = PromptSession(completer=completer, style=style, bottom_toolbar=get_bottom_toolbar)
         use_prompt_toolkit = True
@@ -170,6 +256,7 @@ async def main():
                     ("/pwd", "Print current working directory"),
                     ("/ls", "List files in current directory"),
                     ("/clear", "Clear the terminal window"),
+                    ("/autonomous", "Toggle autonomous mode (skip security confirmation prompts for all commands)"),
                     ("exit / quit", "Exit Omni-Dev"),
                 ]
                 for cmd_name, desc in commands_info:
@@ -181,6 +268,21 @@ async def main():
             if cmd_lower == "/clear":
                 os.system("cls" if os.name == "nt" else "clear")
                 print_banner(agent)
+                continue
+
+            # /autonomous
+            if cmd_lower == "/autonomous":
+                console.print(f"\n[bold cyan]{cmd}[/bold cyan]")
+                current_state = os.environ.get("OMNI_AUTONOMOUS", "false").lower() == "true"
+                new_state = not current_state
+                os.environ["OMNI_AUTONOMOUS"] = "true" if new_state else "false"
+                try:
+                    from dotenv import set_key
+                    set_key(".env", "OMNI_AUTONOMOUS", "true" if new_state else "false")
+                except Exception:
+                    pass
+                status_str = "[bold green]ENABLED[/bold green] (security prompts disabled)" if new_state else "[bold yellow]DISABLED[/bold yellow] (security prompts active)"
+                console.print(f"  [dim]└[/dim] Autonomous Mode is now {status_str}.")
                 continue
 
             # /pwd
@@ -375,6 +477,7 @@ async def main():
                         set_key(".env", "OMNI_MODEL", new_model)
                     except Exception:
                         pass
+                    sync_cognee_config()
                     console.print(f"  [dim]└[/dim] [bold green]Model switched to:[/bold green] {new_model}")
                 continue
 
@@ -429,11 +532,14 @@ async def main():
 
                 if key_value:
                     os.environ[provider_key] = key_value
+                    if provider_key == "OLLAMA_API_KEY" and not os.environ.get("OLLAMA_API_BASE"):
+                        os.environ["OLLAMA_API_BASE"] = "https://ollama.com"
                     try:
                         from dotenv import set_key
                         set_key(".env", provider_key, key_value)
                     except Exception:
                         pass
+                    sync_cognee_config()
                     console.print(f"  [dim]└[/dim] [bold green]API key saved:[/bold green] {provider_key}")
                 continue
 
@@ -476,6 +582,34 @@ async def main():
                     console.print(table)
                 else:
                     console.print("  [dim]└[/dim] [italic red]No memories found in the Cognee graph.[/italic red]")
+                continue
+
+            # /history
+            if cmd_lower == "/history":
+                console.print(f"\n[bold cyan]{cmd}[/bold cyan]")
+                if not agent.messages or len(agent.messages) <= 1:
+                    console.print("  [dim]└[/dim] [italic red]No session history yet.[/italic red]")
+                else:
+                    table = Table(title="Omni-Dev Conversation Session History", border_style="cyan")
+                    table.add_column("Role", style="bold magenta", width=12)
+                    table.add_column("Content / Action", style="cyan")
+                    for msg in agent.messages:
+                        role = msg.get("role", "unknown").upper()
+                        if role == "SYSTEM":
+                            content = msg.get("content", "")
+                            preview = content.splitlines()[0] if content else ""
+                            table.add_row("SYSTEM", f"[dim]System Instruction: {preview[:60]}...[/dim]")
+                        elif role == "TOOL":
+                            name = msg.get("name", "tool")
+                            content = msg.get("content", "")
+                            table.add_row("TOOL RESULT", f"[dim]Tool '{name}' returned {len(content)} chars: {content[:100]}...[/dim]")
+                        else:
+                            content = msg.get("content", "") or ""
+                            if msg.get("tool_calls"):
+                                tc_desc = ", ".join(t.get("function", {}).get("name", "") for t in msg["tool_calls"])
+                                content += f" [dim](Triggered tools: {tc_desc})[/dim]"
+                            table.add_row(role, content.strip())
+                    console.print(table)
                 continue
 
             # Skip empty input
@@ -536,10 +670,15 @@ async def main():
                 pass
 
             # Render Response
-            console.print("\n" + "─" * 75)
-            console.print("[bold cyan]✨ Omni-Dev[/bold cyan]\n")
-            console.print(Markdown(final_response))
-            console.print("\n" + "─" * 75)
+            console.print()
+            console.print("[bold cyan]✨ Omni-Dev[/bold cyan]")
+            
+            # Print response with a beautiful vertical accent line on the left
+            grid = Table.grid(padding=(0, 1))
+            grid.add_column(style="bold cyan")
+            grid.add_column()
+            grid.add_row("│", Markdown(final_response))
+            console.print(grid)
             console.print()
 
         except KeyboardInterrupt:
