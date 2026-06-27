@@ -34,6 +34,18 @@ from rich.table import Table
 warnings.filterwarnings("ignore", category=UserWarning)
 import logging
 logging.getLogger("cognee").setLevel(logging.CRITICAL)
+os.environ["COGNEE_SKIP_CONNECTION_TEST"] = "true"
+try:
+    import loguru
+    loguru.logger.disable("cognee")
+except Exception:
+    pass
+
+from rich._spinners import SPINNERS
+SPINNERS["multi_squares"] = {
+    "interval": 80,
+    "frames": ["▖▘▝", "▘▝▗", "▝▗▖", "▗▖▘"]
+}
 
 from src.agent.core import OmniDevAgent
 
@@ -142,18 +154,45 @@ def print_banner(agent: OmniDevAgent):
     except Exception:
         branch = "No Git"
 
+    logo_lines = [
+        r"   /.^.\   ",
+        r"  // * \\  ",
+        r" (// | \\) ",
+        r"  \\ | //  ",
+        r"   \.v./   ",
+        r"           "
+    ]
+    text_lines = [
+        "  ██████╗ ███╗   ███╗███╗   ██╗██╗       ██████╗ ███████╗██╗   ██╗",
+        " ██╔═══██╗████╗ ████║████╗  ██║██║       ██╔══██╗██╔════╝██║   ██║",
+        " ██║   ██║██╔████╔██║██╔██╗ ██║██║██████╗██║  ██║█████╗  ██║   ██║",
+        " ██║   ██║██║╚██╔╝██║██║╚██╗██║██║╚═════╝██║  ██║██╔══╝  ╚██╗ ██╔╝",
+        " ╚██████╔╝██║ ╚═╝ ██║██║ ╚████║██║       ██████╔╝███████╗ ╚████╔╝ ",
+        "  ╚═════╝ ╚═╝     ╚═╝╚═╝  ╚═══╝╚═╝       ╚═════╝ ╚══════╝  ╚═══╝  "
+    ]
+
     console.print()
-    console.print("  [bold cyan]/\\\\[/bold cyan]     [bold blue]Omni-Dev CLI 2.0.0[/bold blue]")
-    console.print(" [bold cyan]/  \\\\[/bold cyan]    [dim]Context-Aware Agentic Coding (Cognee Graph Memory)[/dim]")
-    console.print(f"[bold cyan]/____\\\\[/bold cyan]   [bold yellow]{model}[/bold yellow]  |  [green]git: {branch}[/green]")
-    console.print("         [dim]~[/dim]")
+    for logo, text in zip(logo_lines, text_lines):
+        console.print(f"[bold green]{logo}[/bold green]  [bold cyan]{text}[/bold cyan]")
+    console.print()
+    console.print("  [bold white]Context-Aware Agentic Coding[/bold white] [dim](Cognee Graph Memory v2.0)[/dim]")
+    console.print("  [dim]─────────────────────────────────────────────────────────────[/dim]")
+    console.print(f"  [bold green]Model:[/bold green] [bold yellow]{model}[/bold yellow]    [bold green]Git:[/bold green] [cyan]{branch}[/cyan]    [bold green]Status:[/bold green] [bold green]● Online[/bold green]")
     console.print()
 
 
 async def main():
+    import logging
+    logging.getLogger("cognee").setLevel(logging.ERROR)
+    try:
+        import loguru
+        loguru.logger.disable("cognee")
+    except Exception:
+        pass
+
     console.clear()
 
-    with console.status("[bold green]Initializing Omni-Dev and loading memories..."):
+    with console.status("[bold green]Initializing Omni-Dev and loading memories...", spinner="multi_squares", spinner_style="bold green"):
         try:
             agent = OmniDevAgent()
             sync_cognee_config()
@@ -161,6 +200,7 @@ async def main():
             console.print(f"[bold red]Failed to initialize agent:[/bold red] {e}")
             return
 
+    console.clear()
     print_banner(agent)
 
     # Setup interactive PromptSession with autocomplete & live status bar
@@ -192,20 +232,7 @@ async def main():
 
         completer = SlashCommandCompleter(commands_list)
 
-        style = Style.from_dict({
-            'bottom-toolbar': 'bg:#1e1e1e #cccccc',
-        })
-
-        def get_bottom_toolbar():
-            model = os.environ.get("OMNI_MODEL", "groq/openai/gpt-oss-120b").strip()
-            from src.cost_tracker import get_tracker
-            tok = get_tracker().total_tokens
-            cost = get_tracker().total_cost_usd
-            auto_mode = os.environ.get("OMNI_AUTONOMOUS", "false").lower() == "true"
-            auto_str = ' <style color="#ff3333"><b>[AUTONOMOUS]</b></style>' if auto_mode else ''
-            return HTML(f'<b>? for shortcuts</b> <style color="#555555">|</style> Type <b>/</b> to complete <style color="#555555">|</style> Model: <style color="yellow"><b>{model}</b></style>{auto_str} <style color="#555555">|</style> <style color="magenta"><b>{tok:,} tok (${cost:.4f})</b></style>')
-
-        session = PromptSession(completer=completer, style=style, bottom_toolbar=get_bottom_toolbar)
+        session = PromptSession(completer=completer)
         use_prompt_toolkit = True
     except Exception:
         use_prompt_toolkit = False
@@ -547,7 +574,7 @@ async def main():
             if cmd_lower == "/index":
                 import glob
                 console.print(f"\n[bold cyan]{cmd}[/bold cyan]")
-                with console.status("  [dim]└[/dim] [bold magenta]Indexing codebase into Cognee Graph Memory..."):
+                with console.status("  [dim]└[/dim] [bold magenta]Indexing codebase into Cognee Graph Memory...", spinner="multi_squares", spinner_style="bold magenta"):
                     import cognee
                     files_added = 0
                     for filepath in glob.glob(os.path.join(".", "**", "*.*"), recursive=True):
@@ -616,8 +643,66 @@ async def main():
             if not user_input.strip():
                 continue
 
+            # Helper for smooth text generation with green rotating square animation aside
+            def render_smooth_markdown(text: str, accent_color: str = "bold cyan", title: str = None, is_thinking: bool = False):
+                if title:
+                    console.print(f"[{accent_color}]{title}[/{accent_color}]")
+                
+                words = text.split(' ')
+                frames = ["▖▘▝", "▘▝▗", "▝▗▖", "▗▖▘"]  # Multiple rotating squares
+                from rich.live import Live
+                import time
+                
+                grid = Table.grid(padding=(0, 1))
+                grid.add_column(style="bold green")
+                grid.add_column()
+                grid.add_row("▖▘▝", Markdown(""))
+                
+                delay = min(0.015, max(0.003, 1.2 / max(1, len(words))))
+                current_text = ""
+                
+                with Live(grid, console=console, refresh_per_second=30, transient=False) as live:
+                    for i, word in enumerate(words):
+                        current_text += (" " if i > 0 else "") + word
+                        new_grid = Table.grid(padding=(0, 1))
+                        new_grid.add_column(style="bold green")
+                        new_grid.add_column()
+                        prefix = f"  {frames[i % len(frames)]}" if is_thinking else f"{frames[i % len(frames)]} │"
+                        new_grid.add_row(prefix, Markdown(current_text))
+                        live.update(new_grid)
+                        time.sleep(delay)
+                    
+                    final_grid = Table.grid(padding=(0, 1))
+                    final_grid.add_column(style="dim green" if is_thinking else "bold cyan")
+                    final_grid.add_column()
+                    final_prefix = "  │" if is_thinking else "│"
+                    final_grid.add_row(final_prefix, Markdown(current_text))
+                    live.update(final_grid)
+
+            status = None
+
             # Tool call progress callback (clean indented aesthetic)
             def tool_callback(func_name: str, args: dict):
+                nonlocal status
+                if func_name == "assistant_message":
+                    content = args.get("content", "").strip()
+                    if content:
+                        if status: status.stop()
+                        console.print()
+                        render_smooth_markdown(content, accent_color="dim cyan", is_thinking=False)
+                        console.print()
+                        if status: status.start()
+                    return
+
+                if func_name == "think":
+                    thought = args.get("thought", "").strip()
+                    if status: status.stop()
+                    console.print("  [dim]├─[/dim] [bold green]▖▘▝[/bold green] [dim cyan]✻ Thinking...[/dim cyan]")
+                    if thought:
+                        render_smooth_markdown(thought, accent_color="dim", is_thinking=True)
+                    if status: status.start()
+                    return
+
                 markers = {
                     "read_file":       ("[READ]   ", "dim",         f"Reading: {args.get('path', '')}"),
                     "write_file":      ("[CREATE] ", "bold green",  f"Creating: {args.get('path', '')}"),
@@ -627,7 +712,6 @@ async def main():
                     "recall":          ("[RECALL] ", "bold magenta", f"Recalling: {args.get('query', '')}"),
                     "spawn_subagent":  ("[AGENT]  ", "bold cyan",   "Spawning background sub-agent..."),
                     "search_web":      ("[WEB]    ", "bold yellow", f"Web search: {args.get('query', '')}"),
-                    "think":           ("[THINK]  ", "dim cyan",    "Thinking..."),
                     "search_codebase": ("[GREP]   ", "bold yellow", f"Grep: '{args.get('pattern', '')}'"),
                     "glob_files":      ("[GLOB]   ", "dim",         f"Pattern: {args.get('pattern', '')}"),
                     "list_dir":        ("[LS]     ", "dim",         f"List: {args.get('path', '.')}"),
@@ -638,11 +722,13 @@ async def main():
                     "read_url_content":("[FETCH]  ", "bold green",  f"URL: {args.get('url', '')}"),
                     "ask_user":        ("[QUESTION]", "bold yellow", f"Asking user: {args.get('question', '')[:60]}"),
                 }
+                if status: status.stop()
                 if func_name in markers:
                     marker, style, msg = markers[func_name]
                     console.print(f"  [dim]├─[/dim] [{style}]{marker}{msg}[/{style}]")
                 else:
                     console.print(f"  [dim]├─[/dim] [dim][TOOL] {func_name}[/dim]")
+                if status: status.start()
 
             # AUTO-RAG: Deep Memory Retrieval before every message
             import cognee
@@ -658,8 +744,14 @@ async def main():
             augmented_prompt = f"{user_input}{past_context}"
 
             # Execute Task
-            console.print("\n  [dim]└[/dim] [bold green]Omni-Dev is acting...[/bold green]")
-            final_response = await agent.execute_task(augmented_prompt, progress_callback=tool_callback)
+            console.print()
+            status = console.status("[bold green]Generating...[/bold green]", spinner="multi_squares", spinner_style="bold green")
+            status.start()
+            try:
+                final_response = await agent.execute_task(augmented_prompt, progress_callback=tool_callback)
+            finally:
+                if status:
+                    status.stop()
 
             # AUTO-JOURNALING: Store to Cognee Memory
             try:
@@ -671,14 +763,7 @@ async def main():
 
             # Render Response
             console.print()
-            console.print("[bold cyan]✨ Omni-Dev[/bold cyan]")
-            
-            # Print response with a beautiful vertical accent line on the left
-            grid = Table.grid(padding=(0, 1))
-            grid.add_column(style="bold cyan")
-            grid.add_column()
-            grid.add_row("│", Markdown(final_response))
-            console.print(grid)
+            render_smooth_markdown(final_response, accent_color="bold cyan", title="✨ Omni-Dev")
             console.print()
 
         except KeyboardInterrupt:

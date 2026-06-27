@@ -42,8 +42,9 @@ SAFE_COMMANDS = [
 MAX_OUTPUT_LINES = 200
 MAX_OUTPUT_CHARS = 50_000
 
-# Seconds to capture early output from a background/server process before returning
-BACKGROUND_CAPTURE_SECS = 5
+# Seconds to capture early output from a background/server process before returning.
+# 15s gives npx time to download packages before startup detection kicks in.
+BACKGROUND_CAPTURE_SECS = 15
 
 # Commands that are inherently long-running servers — auto-run in background
 SERVER_COMMAND_PATTERNS = [
@@ -59,11 +60,13 @@ SERVER_COMMAND_PATTERNS = [
     r"node\s+\S+",                  # node server.js
     r"npm\s+(start|run\s+dev|run\s+serve)",
     r"yarn\s+(start|dev|serve)",
-    r"npx\s+(ts-node|tsx|nodemon)",
+    r"npx\s+(ts-node|tsx|nodemon|serve|http-server|live-server|lite-server|@angular/cli|react-scripts|vue-cli-service)",
+    r"npx\s+exec\s+serve",
+    r"npm\s+exec\s+serve",
     r"nodemon\s+",
     r"next\s+(start|dev)",
     r"vite\s*(--port)?",
-    r"serve\s+",
+    r"^serve\s+",                   # serve as standalone command (not as sub-command)
     # Ruby
     r"ruby\s+\S+\.rb",
     r"rails\s+server",
@@ -148,7 +151,11 @@ def truncate_output(text: str) -> tuple[str, int]:
 def is_background_command(command: str) -> bool:
     """Detect if the agent requested background execution (Unix & suffix)."""
     stripped = command.strip()
-    if stripped.endswith(" &") or stripped.endswith("&&") is False and stripped.endswith("&"):
+    # BUG FIX: must check endswith("&&") first — "&&" is NOT a background operator
+    # Old code had: `stripped.endswith("&&") is False and stripped.endswith("&")` which
+    # evaluated as `(stripped.endswith("&&") is False) and stripped.endswith("&")` —
+    # that's always True when the string ends with any "&" including "&&".
+    if not stripped.endswith("&&") and stripped.endswith("&"):
         return True
     # Also check for 'start ...' or 'nohup ...'  (Windows/Unix style)
     first_token = stripped.split()[0].lower() if stripped else ""
@@ -286,20 +293,55 @@ class BashTool(BaseTool):
 
                 proc = subprocess.Popen(clean_command, **kwargs)
 
-                # Give it a short window to produce startup output or crash
-                try:
-                    stdout, stderr = proc.communicate(timeout=effective_timeout)
-                except subprocess.TimeoutExpired:
-                    # Process is still alive in background — startup succeeded
+                # Give it a short window to produce startup output or crash.
+                # We read stdout/stderr via threads so we don't deadlock on full pipe buffers.
+                import threading
+                _out_lines: list = []
+                _err_lines: list = []
+
+                def _reader(stream, buf):
                     try:
-                        proc.stdout.close()
-                        proc.stderr.close()
+                        for line in iter(stream.readline, ""):
+                            buf.append(line)
                     except Exception:
                         pass
+
+                t_out = threading.Thread(target=_reader, args=(proc.stdout, _out_lines), daemon=True)
+                t_err = threading.Thread(target=_reader, args=(proc.stderr, _err_lines), daemon=True)
+                t_out.start()
+                t_err.start()
+
+                # Wait up to effective_timeout seconds for the process to exit (crash) or keep running
+                try:
+                    proc.wait(timeout=effective_timeout)
+                    # Process exited quickly — wait for readers to finish
+                    t_out.join(timeout=2)
+                    t_err.join(timeout=2)
+                    stdout = "".join(_out_lines)
+                    stderr = "".join(_err_lines)
+                except subprocess.TimeoutExpired:
+                    # Process is still alive in background — startup succeeded
+                    t_out.join(timeout=2)
+                    t_err.join(timeout=2)
+                    captured_out = "".join(_out_lines).strip()
+                    captured_err = "".join(_err_lines).strip()
+                    startup_output = ""
+                    if captured_out:
+                        startup_output += f"\nStartup stdout:\n{captured_out}"
+                    if captured_err:
+                        startup_output += f"\nStartup stderr:\n{captured_err}"
+                    # Detect port from startup output
+                    port_hint = ""
+                    import re as _re
+                    m = _re.search(r'(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d+)', captured_out + captured_err)
+                    if m:
+                        port_hint = f" Server is listening on port {m.group(1)}. Visit http://localhost:{m.group(1)}"
                     return (
                         f"✅ Background process started (PID {proc.pid}): `{clean_command}`\n"
-                        f"Still running after {effective_timeout}s — startup likely succeeded.\n"
-                        f"To check: use `curl http://localhost:<PORT>` or look for port in the code."
+                        f"Still running after {effective_timeout}s — startup succeeded.{port_hint}\n"
+                        f"Do NOT run this command again — the server is already running.\n"
+                        f"Use browser_action with action='goto' to open the URL directly."
+                        + startup_output
                     )
                 # Process exited quickly — return its output
                 stdout_t, _ = truncate_output(stdout or "")

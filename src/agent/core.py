@@ -83,6 +83,13 @@ def _clean_final_text(text: str) -> str:
     if not text:
         return text
     t = text.strip()
+    if "Tool Calls:" in t:
+        t = t.split("Tool Calls:")[0].strip()
+    if "```tool" in t:
+        t = t.split("```tool")[0].strip()
+    t = re.sub(r'```(?:json|tool)?\s*[\[\{].*?[\]\}]\s*```', '', t, flags=re.DOTALL).strip()
+    if not t:
+        return ""
     # Case 1: entire response is a JSON object like {"name": "think", "arguments": {...}}
     if t.startswith("{") and "\"name\"" in t and "\"arguments\"" in t:
         try:
@@ -219,9 +226,6 @@ class OmniDevAgent:
                 args = json.loads(tc.function.arguments)
             except Exception:
                 args = {}
-
-            if progress_callback:
-                progress_callback(func_name, args)
 
             result = await self._execute_tool(func_name, args)
             results.append((tc, result))
@@ -467,6 +471,17 @@ class OmniDevAgent:
                 # Run read-only tools concurrently, others serially
                 # Always announce tool calls via progress_callback (even concurrent ones)
                 if progress_callback:
+                    if response_message.content and response_message.content.strip():
+                        msg_content = response_message.content.strip()
+                        if "Tool Calls:" in msg_content:
+                            msg_content = msg_content.split("Tool Calls:")[0].strip()
+                        if "```tool" in msg_content:
+                            msg_content = msg_content.split("```tool")[0].strip()
+                        import re
+                        msg_content = re.sub(r'```(?:json|tool)?\s*[\[\{].*?[\]\}]\s*```', '', msg_content, flags=re.DOTALL).strip()
+                        msg_content = _clean_final_text(msg_content)
+                        if msg_content and not msg_content.startswith('{"name":') and not msg_content.startswith('[{"id":') and not msg_content.startswith('[{"name":'):
+                            progress_callback("assistant_message", {"content": msg_content})
                     for tc in tool_calls:
                         try:
                             args = json.loads(tc.function.arguments)
