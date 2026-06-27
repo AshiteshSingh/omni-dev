@@ -59,12 +59,11 @@ def print_banner(agent: OmniDevAgent):
     except Exception:
         branch = "No Git"
 
-    banner_text = f"""[bold cyan]  /\\  [/bold cyan]   [bold blue]Omni-Dev CLI 2.0.0[/bold blue]
-[bold cyan] /  \\ [/bold cyan]   [dim]Context-Aware Agentic Coding (Cognee Graph Memory)[/dim]
-[bold cyan]/____\\[/bold cyan]   [bold yellow]{model}[/bold yellow]  |  [green]git: {branch}[/green]
-         [dim]~[/dim]"""
     console.print()
-    console.print(banner_text)
+    console.print("  [bold cyan]/\\\\[/bold cyan]     [bold blue]Omni-Dev CLI 2.0.0[/bold blue]")
+    console.print(" [bold cyan]/  \\\\[/bold cyan]    [dim]Context-Aware Agentic Coding (Cognee Graph Memory)[/dim]")
+    console.print(f"[bold cyan]/____\\\\[/bold cyan]   [bold yellow]{model}[/bold yellow]  |  [green]git: {branch}[/green]")
+    console.print("         [dim]~[/dim]")
     console.print()
 
 
@@ -320,14 +319,14 @@ async def main():
                     console.print("    2. Groq (groq/llama-3.3-70b-versatile)")
                     console.print("    3. OpenAI (gpt-4o)")
                     console.print("    4. Anthropic (claude-3-5-sonnet-20241022)")
-                    console.print("    5. Google Gemini API (gemini/gemini-1.5-pro)")
-                    console.print("    6. Local Ollama (ollama/llama3)")
-                    console.print("    7. Custom model string")
-                    if use_prompt_toolkit:
-                        choice = await asyncio.get_event_loop().run_in_executor(None, lambda: session.prompt("Enter choice (1-7): "))
-                    else:
-                        from rich.prompt import Prompt as RPrompt
-                        choice = RPrompt.ask("Enter choice (1-7)")
+                    console.print("    5. Google Gemini Studio API (gemini/gemini-1.5-pro)")
+                    console.print("    6. Google Vertex AI (vertex_ai/gemini-1.5-pro)")
+                    console.print("    7. OpenRouter Claude 3.5 Sonnet (openrouter/anthropic/claude-3.5-sonnet)")
+                    console.print("    8. OpenRouter Gemini Pro (openrouter/google/gemini-pro-1.5)")
+                    console.print("    9. Ollama (Local or Cloud API) (ollama/llama3.3)")
+                    console.print("   10. Custom model string")
+                    from rich.prompt import Prompt as RPrompt
+                    choice = await asyncio.get_event_loop().run_in_executor(None, lambda: RPrompt.ask("Enter choice (1-10)"))
                     choice = choice.strip()
                     model_map = {
                         "1": "groq/openai/gpt-oss-120b",
@@ -335,22 +334,31 @@ async def main():
                         "3": "gpt-4o",
                         "4": "claude-3-5-sonnet-20241022",
                         "5": "gemini/gemini-1.5-pro",
-                        "6": "ollama/llama3",
+                        "6": "vertex_ai/gemini-1.5-pro",
+                        "7": "openrouter/anthropic/claude-3.5-sonnet",
+                        "8": "openrouter/google/gemini-pro-1.5",
+                        "9": "ollama/llama3",
                     }
                     if choice in model_map:
                         new_model = model_map[choice]
                     else:
-                        if use_prompt_toolkit:
-                            new_model = await asyncio.get_event_loop().run_in_executor(None, lambda: session.prompt("Enter litellm model string: "))
-                        else:
-                            from rich.prompt import Prompt as RPrompt
-                            new_model = RPrompt.ask("Enter litellm model string")
+                        new_model = await asyncio.get_event_loop().run_in_executor(None, lambda: RPrompt.ask("Enter litellm model string"))
                         new_model = new_model.strip()
 
                 if new_model:
-                    if "/" not in new_model:
+                    if new_model.lower().startswith("model "):
+                        new_model = new_model[6:].strip()
+                    elif new_model.lower().startswith("models/"):
+                        new_model = new_model[7:].strip()
+                    elif new_model.lower().startswith("ollama "):
+                        new_model = "ollama/" + new_model[7:].strip()
+
+                    known_providers = ("groq/", "openai/", "anthropic/", "gemini/", "vertex_ai/", "openrouter/", "ollama/", "mistral/", "deepseek/", "huggingface/", "azure/", "cohere/")
+                    if not any(new_model.lower().startswith(p) for p in known_providers):
                         lower_m = new_model.lower()
-                        if "oss" in lower_m or any(k in lower_m for k in ["llama", "mixtral", "gemma", "deepseek", "whisper"]):
+                        if "/" in new_model:
+                            new_model = "openrouter/" + new_model
+                        elif "oss" in lower_m or any(k in lower_m for k in ["llama", "mixtral", "gemma", "whisper"]):
                             new_model = "groq/" + new_model
                         elif "gpt" in lower_m or "o1" in lower_m or "o3" in lower_m:
                             new_model = "openai/" + new_model
@@ -358,6 +366,8 @@ async def main():
                             new_model = "anthropic/" + new_model
                         elif "gemini" in lower_m:
                             new_model = "gemini/" + new_model
+                        elif any(k in lower_m for k in ["glm", "qwen", "deepseek", "phi", "yi"]):
+                            new_model = "openrouter/" + new_model
 
                     os.environ["OMNI_MODEL"] = new_model
                     try:
@@ -382,38 +392,39 @@ async def main():
                     console.print("    1. Groq (GROQ_API_KEY)")
                     console.print("    2. OpenAI (OPENAI_API_KEY)")
                     console.print("    3. Anthropic (ANTHROPIC_API_KEY)")
-                    console.print("    4. Google Gemini (GEMINI_API_KEY)")
-                    console.print("    5. Mistral (MISTRAL_API_KEY)")
-                    console.print("    6. Custom")
-                    if use_prompt_toolkit:
-                        choice = await asyncio.get_event_loop().run_in_executor(None, lambda: session.prompt("Enter choice (1-6): "))
-                    else:
-                        from rich.prompt import Prompt as RPrompt
-                        choice = RPrompt.ask("Enter choice (1-6)")
+                    console.print("    4. Google Gemini Studio API (GEMINI_API_KEY)")
+                    console.print("    5. Google Vertex AI Project ID (VERTEXAI_PROJECT)")
+                    console.print("    6. Google Vertex AI Location (VERTEXAI_LOCATION)")
+                    console.print("    7. OpenRouter (OPENROUTER_API_KEY)")
+                    console.print("    8. Mistral (MISTRAL_API_KEY)")
+                    console.print("    9. Ollama Cloud API Base URL (OLLAMA_API_BASE)")
+                    console.print("   10. Ollama Cloud API Key (OLLAMA_API_KEY)")
+                    console.print("   11. Custom env var name")
+                    from rich.prompt import Prompt as RPrompt
+                    choice = await asyncio.get_event_loop().run_in_executor(None, lambda: RPrompt.ask("Enter choice (1-11)"))
                     choice = choice.strip()
                     provider_map = {
                         "1": "GROQ_API_KEY",
                         "2": "OPENAI_API_KEY",
                         "3": "ANTHROPIC_API_KEY",
                         "4": "GEMINI_API_KEY",
-                        "5": "MISTRAL_API_KEY",
+                        "5": "VERTEXAI_PROJECT",
+                        "6": "VERTEXAI_LOCATION",
+                        "7": "OPENROUTER_API_KEY",
+                        "8": "MISTRAL_API_KEY",
+                        "9": "OLLAMA_API_BASE",
+                        "10": "OLLAMA_API_KEY",
                     }
                     if choice in provider_map:
                         provider_key = provider_map[choice]
                     else:
-                        if use_prompt_toolkit:
-                            provider_key = await asyncio.get_event_loop().run_in_executor(None, lambda: session.prompt("Enter env var name: "))
-                        else:
-                            from rich.prompt import Prompt as RPrompt
-                            provider_key = RPrompt.ask("Enter env var name")
+                        provider_key = await asyncio.get_event_loop().run_in_executor(None, lambda: RPrompt.ask("Enter env var name"))
                         provider_key = provider_key.strip().upper()
-                        if not provider_key.endswith("_API_KEY"):
+                        if "PROJECT" not in provider_key and "LOCATION" not in provider_key and "BASE" not in provider_key and not provider_key.endswith("_API_KEY"):
                             provider_key += "_API_KEY"
-                    if use_prompt_toolkit:
-                        key_value = await asyncio.get_event_loop().run_in_executor(None, lambda: session.prompt(f"Enter {provider_key}: ", is_password=True))
-                    else:
-                        from rich.prompt import Prompt as RPrompt
-                        key_value = RPrompt.ask(f"Enter {provider_key}", password=True)
+
+                    is_secret = "PROJECT" not in provider_key and "LOCATION" not in provider_key and "BASE" not in provider_key
+                    key_value = await asyncio.get_event_loop().run_in_executor(None, lambda: RPrompt.ask(f"Enter {provider_key}", password=is_secret))
                     key_value = key_value.strip()
 
                 if key_value:
