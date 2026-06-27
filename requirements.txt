@@ -12,6 +12,7 @@ python-dotenv
 
 # CLI / UI
 rich
+prompt_toolkit
 
 # HTTP requests (web search)
 requests
