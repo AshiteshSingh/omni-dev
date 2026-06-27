@@ -72,7 +72,7 @@ def get_git_status() -> Optional[str]:
         return None
 
 
-def get_directory_structure(max_depth: int = 3, max_files: int = 100) -> str:
+def get_directory_structure(max_depth: int = 3, max_files: int = 50) -> str:
     """
     Get approximate directory structure.
     Mirrors getDirectoryStructure() from scratch_repo/src/context.ts.
@@ -127,8 +127,8 @@ def get_readme() -> Optional[str]:
     try:
         with open(readme_path, "r", encoding="utf-8") as f:
             content = f.read()
-        if len(content) > 10000:  # Truncate very long READMEs
-            content = content[:10000] + "\n... (README truncated)"
+        if len(content) > 2000:  # Truncate long READMEs to save tokens
+            content = content[:2000] + "\n... (README truncated)"
         return content
     except Exception:
         return None

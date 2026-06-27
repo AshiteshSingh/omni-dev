@@ -105,10 +105,10 @@ async def main():
             return
 
     console.print("[green]Ready.[/green] Type [bold yellow]exit[/bold yellow] to quit, or [bold yellow]/help[/bold yellow] for commands.\n")
+    print_header(agent)
 
     while True:
         try:
-            print_header(agent)
             user_input = Prompt.ask("\n[bold cyan]You[/bold cyan]")
             cmd = user_input.strip().lower()
 
@@ -124,7 +124,9 @@ async def main():
                 table.add_column("Description", style="white")
                 commands = [
                     ("/help", "Show this help menu"),
-                    ("/model [name]", "Switch LLM provider (e.g., gpt-4o, groq/llama3-70b-8192)"),
+                    ("/tokens", "View current session token usage and status"),
+                    ("/cost", "Detailed session cost breakdown"),
+                    ("/model [name]", "Switch LLM provider (e.g., groq/openai/gpt-oss-120b)"),
                     ("/api_key [provider] [key]", "Add an API key securely"),
                     ("/init", "Analyze codebase -> create AGENTS.md project instructions"),
                     ("/doctor", "Diagnose environment: API keys, tools, dependencies"),
@@ -134,7 +136,6 @@ async def main():
                     ("/compact", "AI-summarize conversation then clear (keeps Cognee memory)"),
                     ("/memory", "Query Cognee Knowledge Graph directly"),
                     ("/index", "Crawl codebase and push to Cognee Graph Memory"),
-                    ("/cost", "Detailed session cost and token breakdown"),
                     ("/history", "View agent message history"),
                     ("/commit [msg]", "Create a Git commit"),
                     ("/pwd", "Print current working directory"),
@@ -163,12 +164,13 @@ async def main():
                 os.system("dir" if os.name == "nt" else "ls -la")
                 continue
 
-            # /cost
-            if cmd == "/cost":
+            # /cost or /tokens
+            if cmd in ["/cost", "/tokens", "/status"]:
+                print_header(agent)
                 from src.cost_tracker import get_tracker
                 console.print(Panel(
                     get_tracker().get_summary(),
-                    title="[bold magenta]Session Cost[/bold magenta]",
+                    title="[bold magenta]Session Token Usage & Cost[/bold magenta]",
                     border_style="magenta",
                 ))
                 continue
