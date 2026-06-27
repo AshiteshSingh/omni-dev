@@ -184,7 +184,17 @@ class OmniDevAgent:
         self.messages.append({"role": "user", "content": prompt})
 
         # Always use latest model in case user hot-swapped it
-        model_name = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro")
+        model_name = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro").strip()
+        if model_name and "/" not in model_name:
+            lower_m = model_name.lower()
+            if any(k in lower_m for k in ["llama", "mixtral", "gemma", "deepseek", "whisper"]):
+                model_name = "groq/" + model_name
+            elif "gpt" in lower_m or "o1" in lower_m or "o3" in lower_m:
+                model_name = "openai/" + model_name
+            elif "claude" in lower_m:
+                model_name = "anthropic/" + model_name
+            elif "gemini" in lower_m:
+                model_name = "gemini/" + model_name
 
         # Agentic loop (mirrors while(true) in query.ts)
         while True:

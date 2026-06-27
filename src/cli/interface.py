@@ -61,18 +61,22 @@ def print_header(agent: OmniDevAgent):
     except Exception:
         branch = "No Git"
 
-    model = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro")
+    model = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro").strip()
+    if model and "/" not in model:
+        lower_m = model.lower()
+        if any(k in lower_m for k in ["llama", "mixtral", "gemma", "deepseek", "whisper"]):
+            model = "groq/" + model
+
     tokens = agent.get_token_usage()
 
     from src.cost_tracker import get_tracker
     cost = get_tracker().total_cost_usd
 
-    # Plain text markers - no emoji in header to avoid any encoding issues
+    # Clean, sleek header bar without directory path clutter
     header_text = (
-        f"[bold cyan]DIR:[/bold cyan] {cwd}  "
-        f"[bold green]GIT:[/bold green] {branch}  "
-        f"[bold yellow]MODEL:[/bold yellow] {model}  "
-        f"[bold magenta]{tokens:,} tok[/bold magenta]  "
+        f"[bold green]GIT:[/bold green] {branch}   |   "
+        f"[bold yellow]MODEL:[/bold yellow] {model}   |   "
+        f"[bold magenta]{tokens:,} tok[/bold magenta]   |   "
         f"[bold red]${cost:.4f}[/bold red]"
     )
     console.print()
@@ -287,7 +291,7 @@ async def main():
                     console.print("\n[bold cyan]Select an LLM Provider/Model:[/bold cyan]")
                     console.print("1. OpenAI (gpt-4o)")
                     console.print("2. Anthropic (claude-3-5-sonnet-20241022)")
-                    console.print("3. Groq (groq/llama3-70b-8192)")
+                    console.print("3. Groq (groq/llama-3.3-70b-versatile)")
                     console.print("4. Google Gemini API (gemini/gemini-1.5-pro)")
                     console.print("5. Google Vertex AI (vertex_ai/gemini-1.5-pro)")
                     console.print("6. Local Ollama (ollama/llama3)")
@@ -297,7 +301,7 @@ async def main():
                     model_map = {
                         1: "gpt-4o",
                         2: "claude-3-5-sonnet-20241022",
-                        3: "groq/llama3-70b-8192",
+                        3: "groq/llama-3.3-70b-versatile",
                         4: "gemini/gemini-1.5-pro",
                         5: "vertex_ai/gemini-1.5-pro",
                         6: "ollama/llama3",
@@ -308,6 +312,17 @@ async def main():
                         new_model = Prompt.ask("[italic]Enter exact litellm model string[/italic]").strip()
 
                 if new_model:
+                    if "/" not in new_model:
+                        lower_m = new_model.lower()
+                        if any(k in lower_m for k in ["llama", "mixtral", "gemma", "deepseek", "whisper"]):
+                            new_model = "groq/" + new_model
+                        elif "gpt" in lower_m or "o1" in lower_m or "o3" in lower_m:
+                            new_model = "openai/" + new_model
+                        elif "claude" in lower_m:
+                            new_model = "anthropic/" + new_model
+                        elif "gemini" in lower_m:
+                            new_model = "gemini/" + new_model
+
                     os.environ["OMNI_MODEL"] = new_model
                     try:
                         from dotenv import set_key
