@@ -146,6 +146,17 @@ class OmniDevAgent:
     """
 
     def __init__(self):
+        # Clean up process environment variables to prevent malformed values/whitespaces
+        for key in list(os.environ.keys()):
+            if key.endswith("_API_KEY") or key.endswith("_API_BASE") or key == "OMNI_MODEL":
+                val = os.environ[key].strip()
+                if (val.startswith("'") and val.endswith("'")) or (val.startswith('"') and val.endswith('"')):
+                    val = val[1:-1].strip()
+                if not val:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+
         self.model_name = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro")
         self.system_instruction = SYSTEM_INSTRUCTION
         self.messages = [{"role": "system", "content": self.system_instruction}]
@@ -265,12 +276,17 @@ class OmniDevAgent:
         # Always use latest model in case user hot-swapped it
         model_name = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro").strip()
         if model_name:
+            while "//" in model_name:
+                model_name = model_name.replace("//", "/")
             if model_name.lower().startswith("model "):
                 model_name = model_name[6:].strip()
             elif model_name.lower().startswith("models/"):
                 model_name = model_name[7:].strip()
             elif model_name.lower().startswith("ollama "):
-                model_name = "ollama/" + model_name[7:].strip()
+                model_name = "ollama/" + model_name[7:].strip().lstrip("/")
+            
+            while "//" in model_name:
+                model_name = model_name.replace("//", "/")
 
             known_providers = ("groq/", "openai/", "anthropic/", "gemini/", "vertex_ai/", "openrouter/", "ollama/", "mistral/", "deepseek/", "huggingface/", "azure/", "cohere/")
             if not any(model_name.lower().startswith(p) for p in known_providers):
@@ -293,14 +309,22 @@ class OmniDevAgent:
             "messages": self.messages,
             "tools": self._tool_schemas,
             "tool_choice": "auto",
+            "timeout": 120,
         }
         if model_name.startswith("ollama/"):
             api_base = os.environ.get("OLLAMA_API_BASE")
-            if not api_base and (os.environ.get("OLLAMA_API_KEY") or ":cloud" in model_name or "-cloud" in model_name or "cloud" in model_name.lower()):
+            model_lower = model_name.lower()
+            is_cloud = any(k in model_lower for k in ["cloud", ":cloud", "-cloud"]) or (os.environ.get("OLLAMA_API_KEY") and os.environ.get("OLLAMA_API_KEY").strip())
+            if is_cloud and (not api_base or api_base == "http://localhost:11434"):
                 api_base = "https://ollama.com"
                 os.environ["OLLAMA_API_BASE"] = api_base
-            if api_base:
-                completion_kwargs["api_base"] = api_base
+            elif not api_base:
+                api_base = "http://localhost:11434"
+            
+            completion_kwargs["api_base"] = api_base
+            api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
+            if is_cloud and api_key:
+                completion_kwargs["api_key"] = api_key
 
         # Agentic loop (mirrors while(true) in query.ts)
         MAX_ITERATIONS = 40
@@ -312,21 +336,32 @@ class OmniDevAgent:
             try:
                 try:
                     response = litellm.completion(**completion_kwargs)
-                except litellm.exceptions.BadRequestError:
-                    # Fallback: try without tools (some models reject tool schemas)
-                    fallback_kwargs = dict(completion_kwargs)
-                    fallback_kwargs.pop("tools", None)
-                    fallback_kwargs.pop("tool_choice", None)
-                    response = litellm.completion(**fallback_kwargs)
-                    text = response.choices[0].message.content or ""
-                    return (
-                        f"*(Warning: `{model_name}` rejected the tool schema. "
-                        "Tools disabled. Switch to gpt-4o or gemini-1.5-pro for full capabilities.)*\n\n"
-                        + text
+                except (litellm.exceptions.BadRequestError, Exception) as e:
+                    # Fallback: try without tools (some models or API wrappers reject tool schemas or return 400 with them)
+                    is_tool_or_400 = isinstance(e, litellm.exceptions.BadRequestError) or any(
+                        k in str(e).lower() for k in ["400", "bad request", "tool", "ollamaexception"]
                     )
+                    if is_tool_or_400:
+                        fallback_kwargs = dict(completion_kwargs)
+                        fallback_kwargs.pop("tools", None)
+                        fallback_kwargs.pop("tool_choice", None)
+                        try:
+                            response = litellm.completion(**fallback_kwargs)
+                        except Exception:
+                            raise e
+                        text = response.choices[0].message.content or ""
+                        return (
+                            f"*(Warning: `{model_name}` rejected the tool schema or returned a bad request with tools. "
+                            "Tools disabled. Switch to gpt-4o or gemini-1.5-pro for full capabilities.)*\n\n"
+                            + text
+                        )
+                    else:
+                        raise e
 
             except Exception as e:
                 error_msg = getattr(e, "message", str(e)) or repr(e)
+                if any(k in error_msg for k in ["10061", "Connection refused", "actively refused", "Failed to connect"]):
+                    return f"🚨 **Ollama / Local Server Offline (`{model_name}`):** Could not connect to local API server.\n\n*Fix:* If using Ollama, open a new terminal and run `ollama serve`. Or type `/model` in this CLI to switch to a cloud provider (e.g., `groq/llama-3.3-70b-versatile`, `gemini/gemini-2.5-pro`, or `openai/gpt-4o`)."
                 if "403" in error_msg or "Permission" in error_msg:
                     return f"🚨 **API Permission Error:** `{model_name}` access denied.\n\n*Raw Error:* {error_msg}"
                 if any(k in error_msg.lower() for k in ["auth", "key", "401", "invalid_api_key"]):

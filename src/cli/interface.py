@@ -11,6 +11,7 @@ import os
 
 # Windows UTF-8 fix: must happen before Rich is imported
 if sys.platform == "win32":
+    os.system("chcp 65001 > nul 2>&1")
     os.environ.setdefault("PYTHONUTF8", "1")
     if hasattr(sys.stdout, "buffer"):
         enc = getattr(sys.stdout, "encoding", "") or ""
@@ -33,25 +34,57 @@ from rich.table import Table
 
 warnings.filterwarnings("ignore", category=UserWarning)
 import logging
-logging.getLogger("cognee").setLevel(logging.CRITICAL)
+import contextlib
+for _logger in ["cognee", "OntologyAdapter", "litellm", "httpx", "alembic", "alembic.runtime.migration", "sqlalchemy", "sqlalchemy.engine", "dlt", "urllib3", "asyncio"]:
+    logging.getLogger(_logger).setLevel(logging.CRITICAL)
+logging.root.setLevel(logging.CRITICAL)
 os.environ["COGNEE_SKIP_CONNECTION_TEST"] = "true"
 try:
     import loguru
-    loguru.logger.disable("cognee")
+    loguru.logger.remove()
 except Exception:
     pass
+
+@contextlib.contextmanager
+def suppress_output():
+    save_stdout, save_stderr = sys.stdout, sys.stderr
+    try:
+        sys.stdout = io.StringIO()
+        sys.stderr = io.StringIO()
+        yield
+    finally:
+        sys.stdout, sys.stderr = save_stdout, save_stderr
 
 from rich._spinners import SPINNERS
 SPINNERS["multi_squares"] = {
     "interval": 80,
-    "frames": ["▖▘▝", "▘▝▗", "▝▗▖", "▗▖▘"]
+    "frames": ["[#  ]", "[## ]", "[###]", "[ ##]", "[  #]", "[   ]"]
 }
 
 from src.agent.core import OmniDevAgent
 
 load_dotenv()
-if not os.environ.get("OLLAMA_API_BASE") and os.environ.get("OLLAMA_API_KEY"):
-    os.environ["OLLAMA_API_BASE"] = "https://ollama.com"
+
+# Clean up environment variables loaded from .env to prevent malformed values/whitespaces
+for key in list(os.environ.keys()):
+    if key.endswith("_API_KEY") or key.endswith("_API_BASE") or key == "OMNI_MODEL":
+        val = os.environ[key].strip()
+        # Remove single or double quotes
+        if (val.startswith("'") and val.endswith("'")) or (val.startswith('"') and val.endswith('"')):
+            val = val[1:-1].strip()
+        if not val:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = val
+
+if not os.environ.get("OLLAMA_API_BASE") or os.environ.get("OLLAMA_API_BASE") == "http://localhost:11434":
+    model = os.environ.get("OMNI_MODEL", "")
+    api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
+    is_cloud_model = "cloud" in model.lower()
+    if api_key or is_cloud_model:
+        os.environ["OLLAMA_API_BASE"] = "https://ollama.com"
+    elif not os.environ.get("OLLAMA_API_BASE"):
+        os.environ["OLLAMA_API_BASE"] = "http://localhost:11434"
 
 def sync_cognee_config():
     """Sync configuration dynamically into Cognee based on OMNI_MODEL and env vars."""
@@ -60,6 +93,8 @@ def sync_cognee_config():
         import cognee
         
         model_name = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro").strip()
+        while "//" in model_name:
+            model_name = model_name.replace("//", "/")
         provider = "openai"
         model = "gpt-4o"
         api_key = ""
@@ -93,7 +128,7 @@ def sync_cognee_config():
             elif prov_prefix == "ollama":
                 provider = "ollama"
                 model = model_part
-                api_key = os.environ.get("OLLAMA_API_KEY", "")
+                api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
                 endpoint = os.environ.get("OLLAMA_API_BASE")
             elif prov_prefix == "mistral":
                 provider = "mistral"
@@ -475,12 +510,18 @@ async def main():
                         new_model = new_model.strip()
 
                 if new_model:
+                    new_model = new_model.strip()
+                    while "//" in new_model:
+                        new_model = new_model.replace("//", "/")
                     if new_model.lower().startswith("model "):
                         new_model = new_model[6:].strip()
                     elif new_model.lower().startswith("models/"):
                         new_model = new_model[7:].strip()
                     elif new_model.lower().startswith("ollama "):
-                        new_model = "ollama/" + new_model[7:].strip()
+                        new_model = "ollama/" + new_model[7:].strip().lstrip("/")
+                    
+                    while "//" in new_model:
+                        new_model = new_model.replace("//", "/")
 
                     known_providers = ("groq/", "openai/", "anthropic/", "gemini/", "vertex_ai/", "openrouter/", "ollama/", "mistral/", "deepseek/", "huggingface/", "azure/", "cohere/")
                     if not any(new_model.lower().startswith(p) for p in known_providers):
@@ -504,6 +545,17 @@ async def main():
                         set_key(".env", "OMNI_MODEL", new_model)
                     except Exception:
                         pass
+
+                    # Automatically set API base to cloud if switched to a cloud ollama model
+                    if new_model.startswith("ollama/") and "cloud" in new_model.lower():
+                        if not os.environ.get("OLLAMA_API_BASE") or os.environ.get("OLLAMA_API_BASE") == "http://localhost:11434":
+                            os.environ["OLLAMA_API_BASE"] = "https://ollama.com"
+                            try:
+                                from dotenv import set_key
+                                set_key(".env", "OLLAMA_API_BASE", "https://ollama.com")
+                            except Exception:
+                                pass
+
                     sync_cognee_config()
                     console.print(f"  [dim]└[/dim] [bold green]Model switched to:[/bold green] {new_model}")
                 continue
@@ -559,8 +611,13 @@ async def main():
 
                 if key_value:
                     os.environ[provider_key] = key_value
-                    if provider_key == "OLLAMA_API_KEY" and not os.environ.get("OLLAMA_API_BASE"):
+                    if provider_key == "OLLAMA_API_KEY" and (not os.environ.get("OLLAMA_API_BASE") or os.environ.get("OLLAMA_API_BASE") == "http://localhost:11434"):
                         os.environ["OLLAMA_API_BASE"] = "https://ollama.com"
+                        try:
+                            from dotenv import set_key
+                            set_key(".env", "OLLAMA_API_BASE", "https://ollama.com")
+                        except Exception:
+                            pass
                     try:
                         from dotenv import set_key
                         set_key(".env", provider_key, key_value)
@@ -649,14 +706,14 @@ async def main():
                     console.print(f"[{accent_color}]{title}[/{accent_color}]")
                 
                 words = text.split(' ')
-                frames = ["▖▘▝", "▘▝▗", "▝▗▖", "▗▖▘"]  # Multiple rotating squares
+                frames = ["[#  ]", "[## ]", "[###]", "[ ##]", "[  #]", "[   ]"]  # Multiple rotating blocks
                 from rich.live import Live
                 import time
                 
                 grid = Table.grid(padding=(0, 1))
                 grid.add_column(style="bold green")
                 grid.add_column()
-                grid.add_row("▖▘▝", Markdown(""))
+                grid.add_row("[###]", Markdown(""))
                 
                 delay = min(0.015, max(0.003, 1.2 / max(1, len(words))))
                 current_text = ""
@@ -697,7 +754,7 @@ async def main():
                 if func_name == "think":
                     thought = args.get("thought", "").strip()
                     if status: status.stop()
-                    console.print("  [dim]├─[/dim] [bold green]▖▘▝[/bold green] [dim cyan]✻ Thinking...[/dim cyan]")
+                    console.print("  [dim]├─[/dim] [bold green][###][/bold green] [dim cyan]✻ Thinking...[/dim cyan]")
                     if thought:
                         render_smooth_markdown(thought, accent_color="dim", is_thinking=True)
                     if status: status.start()
@@ -734,10 +791,11 @@ async def main():
             import cognee
             past_context = ""
             try:
-                deep_query = f"User Request: {user_input} | Recent Agent Actions"
-                retrieved = await cognee.search("SEARCH_TYPE_INSIGHTS", query_text=deep_query)
-                if retrieved:
-                    past_context = "\n\n<deep_graph_context>\n" + "\n".join(str(r) for r in retrieved) + "\n</deep_graph_context>"
+                with suppress_output():
+                    deep_query = f"User Request: {user_input} | Recent Agent Actions"
+                    retrieved = await cognee.search("SEARCH_TYPE_INSIGHTS", query_text=deep_query)
+                    if retrieved:
+                        past_context = "\n\n<deep_graph_context>\n" + "\n".join(str(r) for r in retrieved) + "\n</deep_graph_context>"
             except Exception:
                 pass
 
@@ -755,9 +813,10 @@ async def main():
 
             # AUTO-JOURNALING: Store to Cognee Memory
             try:
-                journal_entry = f"User Request: {user_input}\nOmni-Dev Response: {final_response}"
-                await cognee.add(journal_entry, dataset_name="user_memory")
-                await cognee.cognify()
+                with suppress_output():
+                    journal_entry = f"User Request: {user_input}\nOmni-Dev Response: {final_response}"
+                    await cognee.add(journal_entry, dataset_name="user_memory")
+                    await cognee.cognify()
             except Exception:
                 pass
 
