@@ -26,15 +26,15 @@ async def _get_page(headless: bool = False):
         _pw_instance = await async_playwright().start()
 
     if _browser_instance is None or not _browser_instance.is_connected():
-        # slow_mo=75 adds a natural human delay between keystrokes and clicks
+        # Force headless=False so user ALWAYS sees the real browser window live on screen
         _browser_instance = await _pw_instance.chromium.launch(
-            headless=headless,
-            slow_mo=75,
+            headless=False,
+            slow_mo=100,
             args=["--start-maximized", "--disable-infobars"]
         )
 
-    # Use viewport None to allow maximized or natural window resizing
-    context = await _browser_instance.new_context(viewport={"width": 1280, "height": 800})
+    # Use no_viewport=True to allow maximized full-screen native window
+    context = await _browser_instance.new_context(no_viewport=True)
     _page_instance = await context.new_page()
     return _page_instance
 

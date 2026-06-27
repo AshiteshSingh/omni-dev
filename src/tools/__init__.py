@@ -17,6 +17,7 @@ from .memory_tools import MemoryReadTool, MemoryWriteTool
 from .web_search_tool import WebSearchTool
 from .browser_tool import BrowserTool
 from .url_read_tool import UrlReadTool
+from .ask_user_tool import AskUserTool
 
 __all__ = [
     "BashTool",
@@ -36,6 +37,7 @@ __all__ = [
     "WebSearchTool",
     "BrowserTool",
     "UrlReadTool",
+    "AskUserTool",
 ]
 
 def get_all_tools():
@@ -58,6 +60,7 @@ def get_all_tools():
         WebSearchTool(),
         BrowserTool(),
         UrlReadTool(),
+        AskUserTool(),
     ]
 
 def get_json_schemas():

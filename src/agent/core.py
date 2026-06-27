@@ -55,7 +55,8 @@ SYSTEM_INSTRUCTION = (
     "7. Analyze errors and try alternative approaches instead of giving up.\n"
     "8. Use architect to plan large features before implementing them.\n"
     "9. Use browser_action to control a real web browser (open URL, click, type, scroll, screenshot like a human).\n"
-    "10. Use read_url_content to quickly fetch and read full text from documentation or search result URLs."
+    "10. Use read_url_content to quickly fetch and read full text from documentation or search result URLs.\n"
+    "11. Use ask_user whenever you need user clarification or feedback mid-task. Do NOT stop your turn to ask a question; call ask_user instead."
 )
 
 
