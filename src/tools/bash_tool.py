@@ -7,8 +7,10 @@ Enhanced version with:
 - User approval for dangerous commands
 - Timeout support
 - Output truncation (mirrors formatOutput utility)
+- Windows-safe background process handling (& suffix converted to START)
 """
 import os
+import re
 import subprocess
 import asyncio
 from typing import Any, Dict, Optional
@@ -19,7 +21,7 @@ from .base_tool import BaseTool
 BANNED_COMMANDS = [
     "rm", "rmdir", "del", "format", "mkfs", "dd", "sudo", "su",
     "chmod", "chown", "passwd", "shutdown", "reboot", "halt",
-    "kill", "killall", "pkill", ":(){:|:&};:",  # fork bomb
+    "killall", "pkill", ":{:|:&};:",  # fork bomb
     "curl | bash", "wget | bash", "eval", "exec",
 ]
 
@@ -27,17 +29,67 @@ BANNED_COMMANDS = [
 SAFE_COMMANDS = [
     "git status", "git diff", "git log", "git branch", "git show",
     "git fetch", "git remote",
-    "pwd", "ls", "dir", "tree",
+    "pwd", "ls", "dir", "tree", "type",
     "date", "which", "where",
-    "cat", "head", "tail", "grep", "find", "echo",
+    "cat", "head", "tail", "grep", "find", "findstr", "echo",
     "python --version", "python3 --version", "node --version", "npm --version",
     "pip list", "pip show",
     "whoami", "hostname",
     "cd",
+    "pytest", "npm test",
 ]
 
 MAX_OUTPUT_LINES = 200
 MAX_OUTPUT_CHARS = 50_000
+
+# Seconds to capture early output from a background/server process before returning
+BACKGROUND_CAPTURE_SECS = 5
+
+# Commands that are inherently long-running servers — auto-run in background
+SERVER_COMMAND_PATTERNS = [
+    # Python servers / frameworks
+    r"python\S*\s+\S+\.py",        # python somefile.py / python3 app.py
+    r"python\S*\s+-m\s+(http\.server|flask|uvicorn|gunicorn|aiohttp|tornado|sanic)",
+    r"flask\s+run",
+    r"uvicorn\s+",
+    r"gunicorn\s+",
+    r"fastapi\s+",
+    r"django\S*\s+runserver",
+    # Node / JS
+    r"node\s+\S+",                  # node server.js
+    r"npm\s+(start|run\s+dev|run\s+serve)",
+    r"yarn\s+(start|dev|serve)",
+    r"npx\s+(ts-node|tsx|nodemon)",
+    r"nodemon\s+",
+    r"next\s+(start|dev)",
+    r"vite\s*(--port)?",
+    r"serve\s+",
+    # Ruby
+    r"ruby\s+\S+\.rb",
+    r"rails\s+server",
+    # PHP
+    r"php\s+-S\s+",
+    # Go
+    r"go\s+run\s+",
+    # Java / Spring
+    r"java\s+.*-jar",
+    r"mvn\s+(spring-boot:run|tomcat:run)",
+    # Networking / port forwarding
+    r"http-server",
+    r"live-server",
+    r"netlify\s+(dev|serve)",
+    r"vercel\s+dev",
+]
+
+
+def is_server_command(command: str) -> bool:
+    """Detect if this command would launch a long-running blocking server process."""
+    import re
+    cmd = command.strip().rstrip("&").strip()
+    for pattern in SERVER_COMMAND_PATTERNS:
+        if re.search(pattern, cmd, re.IGNORECASE):
+            return True
+    return False
 
 
 def is_command_safe(command: str) -> bool:
@@ -55,10 +107,11 @@ def is_command_banned(command: str) -> tuple[bool, str]:
     Returns (is_banned, reason).
     Mirrors BashTool.validateInput from scratch_repo.
     """
-    # Split on common shell operators
+    # Strip trailing & before checking
+    clean = command.rstrip().rstrip("&").strip()
     parts = []
     current = ""
-    for char in command:
+    for char in clean:
         if char in ("&", "|", ";"):
             if current.strip():
                 parts.append(current.strip())
@@ -92,10 +145,45 @@ def truncate_output(text: str) -> tuple[str, int]:
     return text, total_lines
 
 
+def is_background_command(command: str) -> bool:
+    """Detect if the agent requested background execution (Unix & suffix)."""
+    stripped = command.strip()
+    if stripped.endswith(" &") or stripped.endswith("&&") is False and stripped.endswith("&"):
+        return True
+    # Also check for 'start ...' or 'nohup ...'  (Windows/Unix style)
+    first_token = stripped.split()[0].lower() if stripped else ""
+    if first_token in ("start", "nohup"):
+        return True
+    return False
+
+
+def prepare_for_windows(command: str) -> tuple[str, bool]:
+    """
+    On Windows, convert Unix background execution patterns:
+    - `command &` → run via `start /b cmd` and capture startup output only
+    Returns (cleaned_command, is_background)
+    """
+    stripped = command.strip()
+    is_bg = False
+
+    # Strip trailing & (not &&)
+    if re.search(r'(?<![&])&$', stripped):
+        stripped = stripped[:-1].strip()
+        is_bg = True
+
+    # Strip 'nohup' prefix (not available on Windows)
+    if stripped.lower().startswith("nohup "):
+        stripped = stripped[6:].strip()
+        is_bg = True
+
+    return stripped, is_bg
+
+
 class BashTool(BaseTool):
     """
     Execute shell/terminal commands.
     Python port of scratch_repo BashTool with security features.
+    Windows-aware: handles background processes that would hang PowerShell.
     """
 
     @property
@@ -108,7 +196,11 @@ class BashTool(BaseTool):
             "Execute a shell command (e.g., git status, ls, pytest, npm run build). "
             "Use this to run tests, inspect files, install packages, or perform system tasks. "
             "Dangerous or destructive commands will require user approval. "
-            "Avoid running interactive commands that require stdin input."
+            "On Windows, background execution (& suffix) is handled automatically — "
+            "the process is spawned in the background and early output is captured. "
+            "Avoid running interactive commands that require stdin input. "
+            "NOTE: This is a Windows PowerShell environment. Do NOT use Unix shell operators "
+            "like sleep, &, nohup, or bash syntax. Use 'start' for background processes."
         )
 
     @property
@@ -120,7 +212,7 @@ class BashTool(BaseTool):
             },
             "timeout": {
                 "type": "integer",
-                "description": "Optional timeout in seconds (max 600). Defaults to 120.",
+                "description": "Optional timeout in seconds (max 600). Defaults to 120. For long-running commands, use a shorter timeout (e.g., 10) to check startup only.",
             },
         }
 
@@ -137,48 +229,112 @@ class BashTool(BaseTool):
 
     async def call(self, command: str, timeout: int = 120) -> str:
         """Execute the command with validation and security checks."""
-        # 1. Check banned commands
-        banned, reason = is_command_banned(command)
+        # 1. Normalize Windows background execution
+        is_windows = os.name == "nt"
+        clean_command = command
+        is_bg = False
+
+        # Auto-detect & strip trailing & on all platforms
+        clean_command, is_bg = prepare_for_windows(command)
+
+        # Also auto-detect long-running server commands — even without &
+        if not is_bg and is_server_command(clean_command):
+            is_bg = True
+
+        # 2. Check banned commands
+        banned, reason = is_command_banned(clean_command)
         if banned:
             return f"❌ Blocked: {reason}"
 
-        # 2. Cap timeout
-        timeout = min(timeout, 600)
+        # 3. Set effective timeout
+        effective_timeout = min(timeout, 600)
+        if is_bg:
+            # Server/background: only wait BACKGROUND_CAPTURE_SECS for startup output
+            effective_timeout = min(timeout, BACKGROUND_CAPTURE_SECS)
 
-        # 3. If not safe, request user approval
-        if not is_command_safe(command) and os.environ.get("OMNI_AUTONOMOUS", "").lower() != "true":
-            print(f"\n\033[91m[SECURITY] Agent wants to run:\033[0m {command}")
-            try:
-                approval = input("\033[93mAllow? (y/n): \033[0m").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                return "Command execution cancelled by user."
+        # 4. If not safe, request user approval
+        if not is_command_safe(clean_command) and os.environ.get("OMNI_AUTONOMOUS", "").lower() != "true":
+            def _get_approval():
+                from rich.console import Console
+                from rich.prompt import Prompt
+                con = Console(highlight=False)
+                con.print(f"\n[bold red][SECURITY] Agent wants to run:[/bold red] [yellow]{command}[/yellow]")
+                try:
+                    return Prompt.ask(" [bold yellow]Allow? (y/n)[/bold yellow]").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    return "n"
+
+            approval = await asyncio.get_event_loop().run_in_executor(None, _get_approval)
             if approval != "y":
                 return "Command execution rejected by user."
 
-        # 4. Execute
+        # 5. Execute
         try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=os.getcwd(),
-            )
-            stdout, _ = truncate_output(result.stdout or "")
-            stderr, _ = truncate_output(result.stderr or "")
+            if is_bg:
+                # Spawn as a detached background process
+                kwargs = {
+                    "shell": True,
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.PIPE,
+                    "text": True,
+                    "cwd": os.getcwd(),
+                }
+                if is_windows:
+                    kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                else:
+                    kwargs["start_new_session"] = True
 
-            output_parts = []
-            if stdout.strip():
-                output_parts.append(stdout.strip())
-            if stderr.strip():
-                output_parts.append(f"[stderr]\n{stderr.strip()}")
-            if result.returncode != 0:
-                output_parts.append(f"[Exit code: {result.returncode}]")
+                proc = subprocess.Popen(clean_command, **kwargs)
 
-            return "\n".join(output_parts) if output_parts else "Command executed successfully with no output."
+                # Give it a short window to produce startup output or crash
+                try:
+                    stdout, stderr = proc.communicate(timeout=effective_timeout)
+                except subprocess.TimeoutExpired:
+                    # Process is still alive in background — startup succeeded
+                    try:
+                        proc.stdout.close()
+                        proc.stderr.close()
+                    except Exception:
+                        pass
+                    return (
+                        f"✅ Background process started (PID {proc.pid}): `{clean_command}`\n"
+                        f"Still running after {effective_timeout}s — startup likely succeeded.\n"
+                        f"To check: use `curl http://localhost:<PORT>` or look for port in the code."
+                    )
+                # Process exited quickly — return its output
+                stdout_t, _ = truncate_output(stdout or "")
+                stderr_t, _ = truncate_output(stderr or "")
+                output_parts = []
+                if stdout_t.strip():
+                    output_parts.append(stdout_t.strip())
+                if stderr_t.strip():
+                    output_parts.append(f"[stderr]\n{stderr_t.strip()}")
+                if proc.returncode != 0:
+                    output_parts.append(f"[Exit code: {proc.returncode}] — Process exited immediately (startup error).")
+                return "\n".join(output_parts) if output_parts else "Process exited immediately with no output."
+            else:
+                result = subprocess.run(
+                    clean_command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=effective_timeout,
+                    cwd=os.getcwd(),
+                )
+                stdout, _ = truncate_output(result.stdout or "")
+                stderr, _ = truncate_output(result.stderr or "")
+
+                output_parts = []
+                if stdout.strip():
+                    output_parts.append(stdout.strip())
+                if stderr.strip():
+                    output_parts.append(f"[stderr]\n{stderr.strip()}")
+                if result.returncode != 0:
+                    output_parts.append(f"[Exit code: {result.returncode}]")
+
+                return "\n".join(output_parts) if output_parts else "Command executed successfully with no output."
 
         except subprocess.TimeoutExpired:
-            return f"Command timed out after {timeout}s."
+            return f"Command timed out after {effective_timeout}s."
         except Exception as e:
             return f"Error running command: {e}"

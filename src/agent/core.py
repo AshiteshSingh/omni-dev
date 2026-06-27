@@ -45,6 +45,12 @@ SYSTEM_INSTRUCTION = (
     "You can read/write files, run commands, search the codebase, manage memory, spawn sub-agents, "
     "browse the web, think through complex problems, list directories, find files with glob patterns, "
     "read/edit Jupyter notebooks, and generate architectural plans.\n\n"
+    "ENVIRONMENT: Windows 11 — PowerShell shell. NEVER use Unix shell syntax:\n"
+    "  ❌ WRONG (Linux/Mac): python server.py &   sleep 2 && curl   nohup python app.py\n"
+    "  ✅ CORRECT (Windows): python server.py  (with a short timeout)  or  start python server.py\n"
+    "  ❌ WRONG: command1 && command2  — on some models this may fail; use separate run_command calls\n"
+    "  ✅ For starting background servers: use run_command with a short timeout (e.g., 5s) so the process "
+    "is spawned and you can continue without blocking. The tool will automatically detect & and handle it.\n\n"
     "CRITICAL RULES:\n"
     "1. NEVER guess file paths. Use list_dir or glob_files to verify paths first.\n"
     "2. ALWAYS read a file before editing it (so you have the exact content).\n"
@@ -56,8 +62,74 @@ SYSTEM_INSTRUCTION = (
     "8. Use architect to plan large features before implementing them.\n"
     "9. Use browser_action to control a real web browser (open URL, click, type, scroll, screenshot like a human).\n"
     "10. Use read_url_content to quickly fetch and read full text from documentation or search result URLs.\n"
-    "11. Use ask_user whenever you need user clarification or feedback mid-task. Do NOT stop your turn to ask a question; call ask_user instead."
+    "11. Use ask_user whenever you need user clarification or feedback mid-task. Do NOT stop your turn to ask a question; call ask_user instead.\n"
+    "12. NEVER run long-running blocking commands without a short timeout. Server start commands must use timeout=5 or less."
 )
+
+
+def _clean_final_text(text: str) -> str:
+    """
+    Clean up the agent's final response text before showing it to the user.
+
+    Some open-source models (e.g. Ollama/Gemma) wrap their last answer in a JSON
+    tool-call block even when they just want to say "I'm done".  When that happens
+    the raw JSON leaks into the UI.  This function:
+    1. If the text is a bare think/summary JSON object, extracts the inner
+       human-readable text from the 'thought' / 'summary' / 'content' field.
+    2. Strips residual ``` fences around JSON blobs.
+    3. Otherwise returns the text unchanged.
+    """
+    import json, re
+    if not text:
+        return text
+    t = text.strip()
+    # Case 1: entire response is a JSON object like {"name": "think", "arguments": {...}}
+    if t.startswith("{") and "\"name\"" in t and "\"arguments\"" in t:
+        try:
+            obj = json.loads(t)
+            args = obj.get("arguments", {})
+            if isinstance(args, str):
+                args = json.loads(args)
+            # Try common field names for human-readable content
+            for field in ("thought", "summary", "content", "message", "text", "result"):
+                if field in args:
+                    return str(args[field]).strip()
+            # Last resort: just return everything in args as readable text
+            return "\n".join(f"**{k}:** {v}" for k, v in args.items())
+        except Exception:
+            pass
+    # Case 2: response is a JSON array of tool calls
+    if t.startswith("[") and "\"name\"" in t and "\"arguments\"" in t:
+        try:
+            items = json.loads(t)
+            parts = []
+            for item in items:
+                args = item.get("arguments", {})
+                if isinstance(args, str):
+                    args = json.loads(args)
+                for field in ("thought", "summary", "content", "message", "text", "result"):
+                    if field in args:
+                        parts.append(str(args[field]).strip())
+                        break
+            if parts:
+                return "\n\n".join(parts)
+        except Exception:
+            pass
+    # Case 3: response starts with a markdown ```json fence containing only a tool call
+    m = re.match(r'^```(?:json)?\s*(\{.*?\})\s*```\s*$', t, re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(1))
+            if "name" in obj and "arguments" in obj:
+                args = obj["arguments"]
+                if isinstance(args, str):
+                    args = json.loads(args)
+                for field in ("thought", "summary", "content", "message", "text", "result"):
+                    if field in args:
+                        return str(args[field]).strip()
+        except Exception:
+            pass
+    return text
 
 
 class OmniDevAgent:
@@ -227,7 +299,11 @@ class OmniDevAgent:
                 completion_kwargs["api_base"] = api_base
 
         # Agentic loop (mirrors while(true) in query.ts)
-        while True:
+        MAX_ITERATIONS = 40
+        iteration = 0
+        last_tool_signatures: set = set()
+        while iteration < MAX_ITERATIONS:
+            iteration += 1
             start_time = time.time()
             try:
                 try:
@@ -270,7 +346,16 @@ class OmniDevAgent:
             # Fallback parser for open-source/cloud models that output tool calls as text inside content
             if not tool_calls and response_message.content:
                 content_str = response_message.content.strip()
-                if any(k in content_str for k in ["Tool Calls:", '"name":', '"function":', '```json']):
+                # Only trigger fallback on EXPLICIT markers — not random text containing "name:"
+                # This prevents the parser from firing on normal explanation text
+                has_explicit_marker = (
+                    "Tool Calls:" in content_str
+                    or "tool_call" in content_str
+                    or '```json' in content_str
+                    or '```tool' in content_str
+                    or ('"name"' in content_str and '"arguments"' in content_str)
+                )
+                if has_explicit_marker:
                     from types import SimpleNamespace
                     import re, uuid
                     valid_tools = set(self._tool_instances.keys())
@@ -294,12 +379,43 @@ class OmniDevAgent:
                             blocks.append(parts[idx:])
                     for match in re.finditer(r'```(?:json)?\s*([\[\{].*?[\]\}])\s*```', content_str, re.DOTALL):
                         blocks.append(match.group(1))
-                    idx_arr = content_str.find("[")
-                    if idx_arr != -1 and "]" in content_str:
-                        blocks.append(content_str[idx_arr:content_str.rfind("]")+1])
-                    idx_obj = content_str.find("{")
-                    if idx_obj != -1 and "}" in content_str:
-                        blocks.append(content_str[idx_obj:content_str.rfind("}")+1])
+
+                    # Scan for all balanced {...} or [...] JSON blocks separated by <tool_call>, newlines, or whitespace
+                    parts = re.split(r'<\|?/?tool_call\|?>|><tool_call>|```(?:json|tool)?|```', content_str)
+                    for part in parts:
+                        part = part.strip()
+                        if not part:
+                            continue
+                        i = 0
+                        while i < len(part):
+                            if part[i] in '{[':
+                                start = i
+                                stack = [part[i]]
+                                in_str = False
+                                esc = False
+                                i += 1
+                                while i < len(part) and stack:
+                                    c = part[i]
+                                    if esc:
+                                        esc = False
+                                    elif c == '\\':
+                                        esc = True
+                                    elif c == '"':
+                                        in_str = not in_str
+                                    elif not in_str:
+                                        if c == '{' or c == '[':
+                                            stack.append(c)
+                                        elif c == '}':
+                                            if stack and stack[-1] == '{':
+                                                stack.pop()
+                                        elif c == ']':
+                                            if stack and stack[-1] == '[':
+                                                stack.pop()
+                                    i += 1
+                                if not stack:
+                                    blocks.append(part[start:i])
+                            else:
+                                i += 1
 
                     for b in blocks:
                         try:
@@ -322,6 +438,14 @@ class OmniDevAgent:
                         except Exception:
                             continue
                     if extracted:
+                        # Deduplication: skip if we already ran the exact same tool calls last iteration
+                        sig = tuple(sorted((tc.function.name, tc.function.arguments) for tc in extracted))
+                        if sig in last_tool_signatures:
+                            # Model is looping — treat as final response
+                            final_text = content_str
+                            self.messages.append({"role": "assistant", "content": final_text})
+                            return _clean_final_text(final_text)
+                        last_tool_signatures.add(sig)
                         tool_calls = extracted
 
             # Handle tool calls
@@ -341,14 +465,15 @@ class OmniDevAgent:
                     self.messages.append({"role": "assistant", "content": None, "tool_calls": tc_dicts})
 
                 # Run read-only tools concurrently, others serially
+                # Always announce tool calls via progress_callback (even concurrent ones)
+                if progress_callback:
+                    for tc in tool_calls:
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except Exception:
+                            args = {}
+                        progress_callback(tc.function.name, args)
                 if self._all_read_only(tool_calls):
-                    if progress_callback:
-                        for tc in tool_calls:
-                            try:
-                                args = json.loads(tc.function.arguments)
-                            except Exception:
-                                args = {}
-                            progress_callback(tc.function.name, args)
                     results = await self._execute_tools_concurrently(tool_calls)
                 else:
                     results = await self._execute_tools_serially(tool_calls, progress_callback)
@@ -366,4 +491,8 @@ class OmniDevAgent:
                 # No tool calls — we have a final response
                 final_text = response_message.content or ""
                 self.messages.append({"role": "assistant", "content": final_text})
-                return final_text
+                return _clean_final_text(final_text)
+
+        # Exceeded max iterations — return whatever we have
+        last_msg = self.messages[-1].get("content") or ""
+        return _clean_final_text(last_msg) or "⚠️ Agent reached maximum iterations. Task may be incomplete."
