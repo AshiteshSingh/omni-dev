@@ -1,8 +1,32 @@
+"""
+interface.py - Enhanced CLI Interface
+
+This is the main CLI for Omni-Dev. Enhanced with new commands ported from
+the TypeScript scratch_repo:
+
+NEW COMMANDS:
+  /init     - Analyze codebase and create AGENTS.md
+  /doctor   - Environment diagnostics
+  /review   - AI code review of git diff
+  /ctx_viz  - Visualize conversation context + token counts
+  /config   - View/set configuration values
+  /bug      - File a bug report with current context
+
+ENHANCED COMMANDS:
+  /compact  - Now uses AI to summarize before clearing (not just reset)
+  /cost     - Now shows detailed cost breakdown from CostTracker
+  /help     - Updated with all new commands
+
+PRESERVED:
+  /model, /api_key, /memory, /index, /history, /clear, /ls, /pwd, /commit
+  All Cognee memory integration (cognee.add/cognify/search)
+"""
 import asyncio
 import os
 import subprocess
 import warnings
 from dotenv import load_dotenv
+
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -21,45 +45,60 @@ load_dotenv()
 
 console = Console()
 
-def print_header(agent):
-    """Prints a premium status header similar to Claude Code."""
+
+def print_header(agent: OmniDevAgent):
+    """Prints the status header (mirrors Claude Code's header bar)."""
     cwd = os.getcwd()
     try:
-        branch = subprocess.check_output("git branch --show-current", shell=True, text=True, stderr=subprocess.STDOUT).strip()
-        if not branch:
-            branch = "No Git Repo"
-    except:
+        branch = subprocess.check_output(
+            "git branch --show-current",
+            shell=True, text=True, stderr=subprocess.STDOUT
+        ).strip() or "No Git Repo"
+    except Exception:
         branch = "No Git Repo"
-        
+
     model = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro")
     tokens = agent.get_token_usage()
-    
-    header_text = f"📁 [bold cyan]{cwd}[/bold cyan] │ 🌿 [bold green]{branch}[/bold green] │ 🧠 [bold yellow]{model}[/bold yellow] │ 🪙 [bold magenta]{tokens} tokens[/bold magenta]"
+    tracker = agent._tool_instances  # Access the tracker through agent
+
+    # Import cost tracker
+    from src.cost_tracker import get_tracker
+    cost = get_tracker().total_cost_usd
+
+    header_text = (
+        f"📁 [bold cyan]{cwd}[/bold cyan] │ "
+        f"🌿 [bold green]{branch}[/bold green] │ "
+        f"🧠 [bold yellow]{model}[/bold yellow] │ "
+        f"🪙 [bold magenta]{tokens:,} tokens[/bold magenta] │ "
+        f"💰 [bold red]${cost:.4f}[/bold red]"
+    )
     console.print()
-    console.print(Panel(header_text, title="Omni-Dev Context", border_style="cyan", padding=(0, 2)))
+    console.print(Panel(header_text, title="[bold]Omni-Dev[/bold]", border_style="cyan", padding=(0, 2)))
+
 
 async def main():
     console.clear()
-    
-    # Professional ASCII Art Banner
-    ascii_banner = """[bold cyan]
-   ____  __  __ _   _ ___       ____  FV 
-  / __ \|  \/  | \ | |_ _|     |  _ \ _____   __
- | |  | | |\/| |  \| || |_____ | | | / _ \ \ / /
- | |__| | |  | | |\  || |_____ | |_| \ __/\ V / 
-  \____/|_|  |_|_| \_|___|     |____/ \___|\_/  
+
+    # ASCII Art Banner
+    ascii_banner = """\
+[bold cyan]
+   ____  __  __ _   _ ___       ____  FV
+  / __ \\|  \\/  | \\ | |_ _|     |  _ \\ _____   __
+ | |  | | |\\/| |  \\| || |_____ | | | / _ \\ \\ / /
+ | |__| | |  | | |\\  || |_____ | |_| \\ __/\\ V /
+  \\____/|_|  |_|_| \\_|___|     |____/ \\___|\\_/
 [/bold cyan]"""
     console.print(ascii_banner)
-    console.print("[italic cyan]   Your Context-Aware, Agentic Developer Assistant[/italic cyan]\n")
-    console.print("="*75 + "\n")
-    
-    with console.status("[bold green]Initializing Omni-Dev and loading memories...") as status:
+    console.print("[italic cyan]   Context-Aware Agentic Developer — Powered by Cognee Graph Memory[/italic cyan]\n")
+    console.print("=" * 75 + "\n")
+
+    with console.status("[bold green]Initializing Omni-Dev and loading memories..."):
         try:
             agent = OmniDevAgent()
         except Exception as e:
             console.print(f"[bold red]Failed to initialize agent:[/bold red] {e}")
             return
-            
+
     console.print("[green]Ready.[/green] Type [bold yellow]exit[/bold yellow] to quit, or [bold yellow]/help[/bold yellow] for commands.\n")
 
     while True:
@@ -67,99 +106,225 @@ async def main():
             print_header(agent)
             user_input = Prompt.ask("\n[bold cyan]You[/bold cyan]")
             cmd = user_input.strip().lower()
-            
+
+            # ── Exit ──────────────────────────────────────────────────────────
             if cmd in ["exit", "quit"]:
-                console.print("[italic]Shutting down Omni-Dev...[/italic]")
+                console.print("[italic]Shutting down Omni-Dev. Goodbye![/italic]")
                 break
 
+            # ── /help ─────────────────────────────────────────────────────────
             if cmd == "/help":
-                table = Table(title="Omni-Dev Commands", border_style="cyan")
-                table.add_column("Command", style="bold green")
+                table = Table(title="Omni-Dev Commands", border_style="cyan", show_lines=True)
+                table.add_column("Command", style="bold green", no_wrap=True)
                 table.add_column("Description", style="white")
-                table.add_row("/help", "Show this help menu")
-                table.add_row("/model <name>", "Switch LLM provider (e.g., gpt-4o, ollama/llama3)")
-                table.add_row("/api_key <provider> <key>", "Add an API key securely (e.g., /api_key OPENAI sk-...)")
-                table.add_row("/pwd", "Print the current working directory")
-                table.add_row("/ls", "List files in the current directory")
-                table.add_row("/cost", "Show total session tokens used")
-                table.add_row("/history", "View internal AI message history")
-                table.add_row("/commit <msg>", "Create a Git commit instantly")
-                table.add_row("/clear", "Clear the terminal screen")
-                table.add_row("/index", "Aggressively crawl codebase and push architecture into Graph Memory")
-                table.add_row("/compact", "Reset short-term memory to save tokens (keeps long-term graph memory)")
-                table.add_row("/memory", "Manually query the Cognee Knowledge Graph")
+
+                commands = [
+                    ("/help", "Show this help menu"),
+                    ("/model [name]", "Switch LLM provider (e.g., gpt-4o, ollama/llama3)"),
+                    ("/api_key [provider] [key]", "Add an API key securely"),
+                    ("/init", "Analyze codebase → create AGENTS.md project instructions"),
+                    ("/doctor", "Diagnose environment: API keys, tools, dependencies"),
+                    ("/review [ref]", "AI code review of git diff (e.g., /review HEAD~1)"),
+                    ("/ctx_viz", "Visualize conversation context & token counts"),
+                    ("/config [key] [val]", "View/set configuration values"),
+                    ("/compact", "AI-summarize conversation then clear (keeps Cognee memory)"),
+                    ("/memory", "Query Cognee Knowledge Graph directly"),
+                    ("/index", "Crawl codebase and push to Cognee Graph Memory"),
+                    ("/cost", "Detailed session cost and token breakdown"),
+                    ("/history", "View agent message history"),
+                    ("/commit [msg]", "Create a Git commit"),
+                    ("/pwd", "Print current working directory"),
+                    ("/ls", "List files in current directory"),
+                    ("/clear", "Clear the terminal"),
+                    ("exit / quit", "Exit Omni-Dev"),
+                ]
+                for cmd_name, desc in commands:
+                    table.add_row(cmd_name, desc)
                 console.print(table)
                 continue
 
+            # ── /clear ────────────────────────────────────────────────────────
             if cmd == "/clear":
-                os.system('cls' if os.name == 'nt' else 'clear')
-                continue
-                
-            if cmd == "/pwd":
-                console.print(f"📁 [bold cyan]Current Directory:[/bold cyan] {os.getcwd()}")
-                continue
-                
-            if cmd == "/ls":
-                console.print("[bold cyan]Directory Contents:[/bold cyan]")
-                os.system('dir' if os.name == 'nt' else 'ls -la')
-                continue
-                
-            if cmd == "/cost":
-                console.print(f"🪙 [bold magenta]Session Tokens Used:[/bold magenta] {agent.get_token_usage()}")
-                continue
-                
-            if cmd == "/history":
-                console.print("[bold cyan]Agent Internal Message History:[/bold cyan]")
-                for msg in agent.messages:
-                    role = msg.get("role", "unknown")
-                    # truncate long content
-                    content = str(msg.get("content", ""))[:200] + ("..." if len(str(msg.get("content", ""))) > 200 else "")
-                    console.print(f"[dim][{role.upper()}][/dim] {content}")
-                continue
-                
-            if cmd.startswith("/commit "):
-                msg = user_input.split(" ", 1)[1].strip()
-                os.system(f'git commit -m "{msg}"')
-                console.print("[bold green]✅ Commit executed.[/bold green]")
+                os.system("cls" if os.name == "nt" else "clear")
                 continue
 
+            # ── /pwd ──────────────────────────────────────────────────────────
+            if cmd == "/pwd":
+                console.print(f"📁 [bold cyan]CWD:[/bold cyan] {os.getcwd()}")
+                continue
+
+            # ── /ls ───────────────────────────────────────────────────────────
+            if cmd == "/ls":
+                console.print("[bold cyan]Directory Contents:[/bold cyan]")
+                os.system("dir" if os.name == "nt" else "ls -la")
+                continue
+
+            # ── /cost ─────────────────────────────────────────────────────────
+            if cmd == "/cost":
+                from src.cost_tracker import get_tracker
+                console.print(Panel(
+                    get_tracker().get_summary(),
+                    title="[bold magenta]💰 Session Cost[/bold magenta]",
+                    border_style="magenta",
+                ))
+                continue
+
+            # ── /history ──────────────────────────────────────────────────────
+            if cmd == "/history":
+                console.print("[bold cyan]Agent Internal Message History:[/bold cyan]")
+                for i, msg in enumerate(agent.messages):
+                    role = msg.get("role", "?").upper()
+                    content = str(msg.get("content", ""))[:200]
+                    if len(str(msg.get("content", ""))) > 200:
+                        content += "..."
+                    tool_calls = msg.get("tool_calls", [])
+                    tc_str = f" [{len(tool_calls)} tool calls]" if tool_calls else ""
+                    console.print(f"  [dim][{i}][/dim] [bold]{role}[/bold]{tc_str}: {content}")
+                continue
+
+            # ── /commit ───────────────────────────────────────────────────────
+            if cmd.startswith("/commit"):
+                parts = user_input.strip().split(" ", 1)
+                if len(parts) == 2:
+                    msg = parts[1].strip()
+                    os.system(f'git add -A && git commit -m "{msg}"')
+                    console.print("[bold green]✅ Git commit created.[/bold green]")
+                else:
+                    console.print("[yellow]Usage: /commit <message>[/yellow]")
+                continue
+
+            # ── /compact ──────────────────────────────────────────────────────
+            if cmd == "/compact":
+                model = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro")
+                with console.status("[bold magenta]AI is summarizing conversation before compacting..."):
+                    from src.commands.compact import compact_command
+                    summary, new_messages = await compact_command(agent.messages, model)
+
+                agent.messages = new_messages
+                from src.context import invalidate_context_cache
+                invalidate_context_cache()
+                agent._context = {}
+
+                console.print("[bold green]✅ Session compacted![/bold green]")
+                if summary and not summary.startswith("Error"):
+                    console.print(Panel(
+                        Markdown(summary[:1500]),
+                        title="[bold cyan]📝 Conversation Summary (saved to Cognee)[/bold cyan]",
+                        border_style="cyan",
+                    ))
+                continue
+
+            # ── /init ─────────────────────────────────────────────────────────
+            if cmd == "/init":
+                with console.status("[bold magenta]Analyzing codebase to create AGENTS.md..."):
+                    from src.commands.init_cmd import init_command
+                    init_prompt = await init_command()
+                console.print("[bold cyan]🔍 Running /init — agent will create AGENTS.md...[/bold cyan]\n")
+                with console.status("[bold green]Omni-Dev is analyzing and writing AGENTS.md..."):
+                    response = await agent.execute_task(init_prompt)
+                console.print(Panel(Markdown(response), title="[bold cyan]/init Result[/bold cyan]", border_style="cyan"))
+                continue
+
+            # ── /doctor ───────────────────────────────────────────────────────
+            if cmd == "/doctor":
+                with console.status("[bold magenta]Running diagnostics..."):
+                    from src.commands.doctor import doctor_command
+                    report = await doctor_command()
+                console.print(Panel(Markdown(report), title="[bold yellow]🩺 Doctor Report[/bold yellow]", border_style="yellow"))
+                continue
+
+            # ── /review ───────────────────────────────────────────────────────
+            if cmd.startswith("/review"):
+                parts = user_input.strip().split(" ", 1)
+                target = parts[1].strip() if len(parts) > 1 else "HEAD"
+                with console.status(f"[bold magenta]Getting git diff for: {target}..."):
+                    from src.commands.review import review_command
+                    review_prompt = await review_command(target)
+                if review_prompt.startswith("Error") or review_prompt.startswith("No changes"):
+                    console.print(f"[yellow]{review_prompt}[/yellow]")
+                    continue
+                console.print("[bold cyan]🔍 Reviewing code changes...[/bold cyan]\n")
+                with console.status("[bold green]AI is reviewing your code..."):
+                    response = await agent.execute_task(review_prompt)
+                console.print(Panel(Markdown(response), title="[bold cyan]Code Review[/bold cyan]", border_style="cyan"))
+                continue
+
+            # ── /ctx_viz ──────────────────────────────────────────────────────
+            if cmd == "/ctx_viz":
+                from src.commands.ctx_viz import ctx_viz_command
+                report = await ctx_viz_command(agent.messages, agent._context)
+                console.print(Panel(Markdown(report), title="[bold blue]🔭 Context Visualization[/bold blue]", border_style="blue"))
+                continue
+
+            # ── /config ───────────────────────────────────────────────────────
+            if cmd.startswith("/config"):
+                parts = user_input.strip().split(" ", 2)
+                key = parts[1].strip() if len(parts) > 1 else None
+                value = parts[2].strip() if len(parts) > 2 else None
+                from src.commands.config_cmd import config_command
+                result = await config_command(key, value)
+                console.print(Panel(Markdown(result), title="[bold yellow]⚙️ Config[/bold yellow]", border_style="yellow"))
+                continue
+
+            # ── /bug ──────────────────────────────────────────────────────────
+            if cmd == "/bug":
+                import platform
+                model = os.environ.get("OMNI_MODEL", "unknown")
+                bug_context = (
+                    f"**OS:** {platform.system()} {platform.version()}\n"
+                    f"**Python:** {platform.python_version()}\n"
+                    f"**Model:** {model}\n"
+                    f"**CWD:** {os.getcwd()}\n"
+                    f"**Message count:** {len(agent.messages)}\n"
+                )
+                console.print(Panel(
+                    bug_context + "\nTo file a bug, copy the above context and open an issue.",
+                    title="[bold red]🐛 Bug Report Context[/bold red]",
+                    border_style="red",
+                ))
+                continue
+
+            # ── /model ────────────────────────────────────────────────────────
             if cmd.startswith("/model"):
                 parts = user_input.strip().split(" ", 1)
                 if len(parts) == 2:
                     new_model = parts[1].strip()
                 else:
-                    # Interactive Mode
                     console.print("\n[bold cyan]Select an LLM Provider/Model:[/bold cyan]")
                     console.print("1. OpenAI (gpt-4o)")
                     console.print("2. Anthropic (claude-3-5-sonnet-20240620)")
                     console.print("3. Groq (groq/llama3-70b-8192)")
                     console.print("4. Google (gemini/gemini-1.5-pro)")
-                    console.print("5. Local Ollama (ollama/llama3)")
-                    console.print("6. Custom Model String")
+                    console.print("5. Google Vertex (vertex_ai/gemini-1.5-pro)")
+                    console.print("6. Local Ollama (ollama/llama3)")
+                    console.print("7. Custom Model String")
                     from rich.prompt import IntPrompt
-                    choice = IntPrompt.ask("Enter choice", choices=["1", "2", "3", "4", "5", "6"], show_choices=False)
-                    
+                    choice = IntPrompt.ask("Enter choice", choices=["1","2","3","4","5","6","7"], show_choices=False)
                     model_map = {
-                        1: "gpt-4o", 
-                        2: "claude-3-5-sonnet-20240620", 
-                        3: "groq/llama3-70b-8192", 
+                        1: "gpt-4o",
+                        2: "claude-3-5-sonnet-20240620",
+                        3: "groq/llama3-70b-8192",
                         4: "gemini/gemini-1.5-pro",
-                        5: "ollama/llama3"
+                        5: "vertex_ai/gemini-1.5-pro",
+                        6: "ollama/llama3",
                     }
                     if int(choice) in model_map:
                         new_model = model_map[int(choice)]
                     else:
-                        new_model = Prompt.ask("[italic]Enter exact litellm model string (e.g. groq/qwen-2.5-32b)[/italic]").strip()
+                        new_model = Prompt.ask("[italic]Enter exact litellm model string[/italic]").strip()
 
                 if new_model:
                     os.environ["OMNI_MODEL"] = new_model
-                    from dotenv import set_key
-                    set_key('.env', 'OMNI_MODEL', new_model)
-                    console.print(f"[bold green]✅ LLM engine hot-swapped to:[/bold green] {new_model}")
+                    try:
+                        from dotenv import set_key
+                        set_key(".env", "OMNI_MODEL", new_model)
+                    except Exception:
+                        pass
+                    console.print(f"[bold green]✅ Model switched to:[/bold green] {new_model}")
                 continue
-                
+
+            # ── /api_key ──────────────────────────────────────────────────────
             if cmd.startswith("/api_key"):
-                # If they passed it inline, e.g., /api_key GROQ sk-...
                 parts = user_input.strip().split(" ", 2)
                 if len(parts) == 3:
                     provider_key = parts[1].strip().upper()
@@ -167,133 +332,143 @@ async def main():
                         provider_key += "_API_KEY"
                     key_value = parts[2].strip()
                 else:
-                    # Interactive Mode
-                    console.print("\n[bold cyan]Select an API Provider:[/bold cyan]")
+                    console.print("\n[bold cyan]Select API Provider:[/bold cyan]")
                     console.print("1. OpenAI (OPENAI_API_KEY)")
                     console.print("2. Anthropic (ANTHROPIC_API_KEY)")
                     console.print("3. Groq (GROQ_API_KEY)")
-                    console.print("4. Google Gemini / Vertex (GEMINI_API_KEY)")
-                    console.print("5. Custom Provider")
+                    console.print("4. Google Gemini (GEMINI_API_KEY)")
+                    console.print("5. Custom")
                     from rich.prompt import IntPrompt
-                    choice = IntPrompt.ask("Enter choice", choices=["1", "2", "3", "4", "5"], show_choices=False)
-                    
-                    provider_map = {1: "OPENAI_API_KEY", 2: "ANTHROPIC_API_KEY", 3: "GROQ_API_KEY", 4: "GEMINI_API_KEY"}
+                    choice = IntPrompt.ask("Enter choice", choices=["1","2","3","4","5"], show_choices=False)
+                    provider_map = {1:"OPENAI_API_KEY", 2:"ANTHROPIC_API_KEY", 3:"GROQ_API_KEY", 4:"GEMINI_API_KEY"}
                     if int(choice) in provider_map:
                         provider_key = provider_map[int(choice)]
                     else:
-                        provider_key = Prompt.ask("[italic]Enter Custom Provider Prefix (e.g. OLLAMA)[/italic]").strip().upper()
+                        provider_key = Prompt.ask("Enter custom provider name").strip().upper()
                         if not provider_key.endswith("_API_KEY"):
                             provider_key += "_API_KEY"
-                            
-                    key_value = Prompt.ask(f"[italic]Enter your {provider_key}[/italic]", password=True).strip()
+                    key_value = Prompt.ask(f"Enter {provider_key}", password=True).strip()
 
                 if key_value:
                     os.environ[provider_key] = key_value
-                    from dotenv import set_key
-                    set_key('.env', provider_key, key_value)
-                    console.print(f"[bold green]✅ API Key securely saved for:[/bold green] {provider_key}")
+                    try:
+                        from dotenv import set_key
+                        set_key(".env", provider_key, key_value)
+                    except Exception:
+                        pass
+                    console.print(f"[bold green]✅ API key saved:[/bold green] {provider_key}")
                 continue
-                
+
+            # ── /index ────────────────────────────────────────────────────────
             if cmd == "/index":
-                with console.status("[bold magenta]Aggressively Indexing Codebase to Graph Database...") as status:
+                import glob
+                with console.status("[bold magenta]Indexing codebase into Cognee Graph Memory..."):
                     import cognee
-                    import glob
                     files_added = 0
-                    for filepath in glob.glob(os.path.join('.', '**', '*.*'), recursive=True):
-                        if 'node_modules' in filepath or '.git' in filepath or 'venv' in filepath or '__pycache__' in filepath:
+                    for filepath in glob.glob(os.path.join(".", "**", "*.*"), recursive=True):
+                        if any(x in filepath for x in ["node_modules", ".git", "venv", "__pycache__"]):
                             continue
                         try:
-                            await cognee.add(f"Project Architecture Node: {filepath}", dataset_name="codebase_architecture")
+                            await cognee.add(
+                                f"Codebase File: {filepath}",
+                                dataset_name="codebase_architecture",
+                            )
                             files_added += 1
-                        except:
+                        except Exception:
                             pass
                     await cognee.cognify()
-                    console.print(f"[bold green]✅ Success: {files_added} files mathematically mapped into Cognee Graph.[/bold green]")
-                continue
-                
-            if cmd == "/compact":
-                agent.compact_session()
-                console.print("[bold green]✅ Short-term session memory compacted! Token count reset.[/bold green]")
+                console.print(f"[bold green]✅ {files_added} files indexed into Cognee Graph Memory.[/bold green]")
                 continue
 
+            # ── /memory ───────────────────────────────────────────────────────
             if cmd == "/memory":
-                query = Prompt.ask("[italic]What memory do you want to recall from the Knowledge Graph?[/italic]")
-                with console.status("[bold magenta]Querying Cognee Graph Database for Long-Term Memory...") as status:
+                query = Prompt.ask("[italic]What memory do you want to recall?[/italic]")
+                with console.status("[bold magenta]Querying Cognee Knowledge Graph..."):
                     import cognee
                     results = await cognee.search("SEARCH_TYPE_INSIGHTS", query_text=query)
-                    
-                    if results:
-                        console.print("\n[bold green]✅ AI Amnesia Solved. Memories retrieved:[/bold green]")
-                        table = Table(title="🧠 Cognee Knowledge Graph Insights", border_style="magenta")
-                        table.add_column("Memory / Insight", style="cyan")
-                        for res in results:
-                            table.add_row(str(res))
-                        console.print(table)
-                    else:
-                        console.print("[italic red]No relevant long-term memories found in the graph.[/italic red]")
+
+                if results:
+                    table = Table(title="🧠 Cognee Knowledge Graph — Long-Term Memories", border_style="magenta")
+                    table.add_column("Memory / Insight", style="cyan")
+                    for res in results:
+                        table.add_row(str(res))
+                    console.print(table)
+                else:
+                    console.print("[italic red]No memories found in the Cognee graph.[/italic red]")
                 continue
 
+            # ── Skip empty input ──────────────────────────────────────────────
             if not user_input.strip():
                 continue
 
-            # Premium UI Callback for Tools
-            def tool_callback(func_name, args):
-                if func_name == "read_file":
-                    console.print(f"📖 [dim]Reading file:[/dim] [cyan]{args.get('path')}[/cyan]")
-                elif func_name == "write_file":
-                    console.print(f"📝 [bold green]Creating file:[/bold green] {args.get('path')}")
-                elif func_name == "edit_file":
-                    console.print(f"✂️ [bold yellow]Surgically Editing:[/bold yellow] {args.get('path')}")
-                elif func_name == "run_command":
-                    console.print(f"⚡ [bold red]Running Terminal Command:[/bold red] {args.get('command')}")
-                elif func_name == "remember":
-                    console.print(f"🧠 [bold magenta]Committing to Graph Memory:[/bold magenta] {args.get('fact')}")
-                elif func_name == "recall":
-                    console.print(f"🔍 [bold magenta]Searching Graph Memory for:[/bold magenta] {args.get('query')}")
-                elif func_name == "spawn_subagent":
-                    console.print(f"🤖 [bold cyan]Spawning Sub-Agent:[/bold cyan] Working on background task...")
-                elif func_name == "search_web":
-                    console.print(f"🌐 [bold yellow]Searching the Web:[/bold yellow] {args.get('query')}")
-                elif func_name == "think":
-                    console.print(f"🤔 [dim cyan]Omni-Dev is thinking out loud...[/dim cyan]")
-                elif func_name == "search_codebase":
-                    console.print(f"🕵️ [bold yellow]Searching Codebase for:[/bold yellow] '{args.get('query')}'")
+            # ── Tool call progress callback ───────────────────────────────────
+            def tool_callback(func_name: str, args: dict):
+                icons = {
+                    "read_file": ("📖", "dim", f"Reading: {args.get('path', '')}"),
+                    "write_file": ("📝", "bold green", f"Creating: {args.get('path', '')}"),
+                    "edit_file": ("✂️", "bold yellow", f"Editing: {args.get('file_path', '')}"),
+                    "run_command": ("⚡", "bold red", f"Running: {args.get('command', '')}"),
+                    "remember": ("🧠", "bold magenta", f"Memorizing: {args.get('fact', '')[:60]}"),
+                    "recall": ("🔍", "bold magenta", f"Recalling: {args.get('query', '')}"),
+                    "spawn_subagent": ("🤖", "bold cyan", "Spawning background sub-agent..."),
+                    "search_web": ("🌐", "bold yellow", f"Searching: {args.get('query', '')}"),
+                    "think": ("🤔", "dim cyan", "Thinking..."),
+                    "search_codebase": ("🕵️", "bold yellow", f"Searching codebase: '{args.get('pattern', '')}'"),
+                    "glob_files": ("🔍", "dim", f"Finding files: {args.get('pattern', '')}"),
+                    "list_dir": ("📁", "dim", f"Listing: {args.get('path', '.')}"),
+                    "read_notebook": ("📓", "dim", f"Reading notebook: {args.get('path', '')}"),
+                    "edit_notebook": ("📓", "bold yellow", f"Editing notebook: {args.get('path', '')}"),
+                    "architect": ("🏗️", "bold blue", f"Planning: {args.get('task', '')[:60]}"),
+                }
+                if func_name in icons:
+                    icon, style, msg = icons[func_name]
+                    console.print(f"  {icon} [{style}]{msg}[/{style}]")
+                else:
+                    console.print(f"  🔧 [dim]{func_name}[/dim]")
 
-            # --- AUTO-RAG (Deep Memory Retrieval) ---
+            # ── AUTO-RAG: Deep Memory Retrieval ───────────────────────────────
             import cognee
             past_context = ""
             try:
-                deep_query = f"User Request: {user_input} | Recent Agent Tool Actions and File Edits"
-                retrieved_memories = await cognee.search("SEARCH_TYPE_INSIGHTS", query_text=deep_query)
-                if retrieved_memories:
-                    past_context = "\n\n<deep_graph_context>\n" + "\n".join(str(r) for r in retrieved_memories) + "\n</deep_graph_context>"
+                deep_query = f"User Request: {user_input} | Recent Agent Actions and File Edits"
+                retrieved = await cognee.search("SEARCH_TYPE_INSIGHTS", query_text=deep_query)
+                if retrieved:
+                    past_context = (
+                        "\n\n<deep_graph_context>\n"
+                        + "\n".join(str(r) for r in retrieved)
+                        + "\n</deep_graph_context>"
+                    )
             except Exception:
                 pass
-                
+
             augmented_prompt = f"{user_input}{past_context}"
 
-            # Execute task
+            # ── Execute Task ──────────────────────────────────────────────────
             console.print("\n")
-            with console.status("[bold green]Omni-Dev is thinking and acting...") as status:
+            with console.status("[bold green]Omni-Dev is thinking and acting..."):
                 final_response = await agent.execute_task(augmented_prompt, progress_callback=tool_callback)
-                
-                # --- AUTO-JOURNALING (Memory Storage) ---
-                try:
-                    journal_entry = f"User Request: {user_input}\nOmni-Dev Response: {final_response}"
-                    await cognee.add(journal_entry, dataset_name="user_memory")
-                    await cognee.cognify()
-                except Exception:
-                    pass
 
-            # Print final response beautifully
-            console.print("\n" + "─"*75)
-            console.print(Panel(Markdown(final_response), title="[bold cyan]Omni-Dev[/bold cyan]", border_style="cyan"))
-            
+            # ── AUTO-JOURNALING: Store to Cognee Memory ───────────────────────
+            try:
+                journal_entry = f"User Request: {user_input}\nOmni-Dev Response: {final_response}"
+                await cognee.add(journal_entry, dataset_name="user_memory")
+                await cognee.cognify()
+            except Exception:
+                pass
+
+            # ── Render Response ───────────────────────────────────────────────
+            console.print("\n" + "─" * 75)
+            console.print(Panel(
+                Markdown(final_response),
+                title="[bold cyan]Omni-Dev[/bold cyan]",
+                border_style="cyan",
+            ))
+
         except KeyboardInterrupt:
-            console.print("\n[italic]Shutting down Omni-Dev...[/italic]")
-            break
+            console.print("\n[italic]Interrupted. Type exit to quit.[/italic]")
         except Exception as e:
-            console.print(f"\n[bold red]Error during execution:[/bold red] {str(e)}")
+            console.print(f"\n[bold red]Error:[/bold red] {e}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

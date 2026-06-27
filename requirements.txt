@@ -1,7 +1,24 @@
+# Core LLM backend (universal provider support)
+litellm
+
+# Cognee Graph Memory (PRESERVED - do not remove)
 cognee
+
+# Google Cloud / Vertex AI
 google-cloud-aiplatform
+
+# Environment variables
 python-dotenv
+
+# CLI / UI
+rich
+
+# HTTP requests (web search)
+requests
+
+# Async support
 asyncio
+
+# API Framework (optional, for server mode)
 fastapi
 uvicorn
-rich

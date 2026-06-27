@@ -1,405 +1,269 @@
+"""
+core.py - Enhanced OmniDevAgent
+
+This is the central agent engine. It has been significantly enhanced by converting
+features from the TypeScript scratch_repo:
+
+NEW FEATURES (ported from scratch_repo):
+  - All 15 tools now available (GlobTool, LSTool, NotebookTools, ArchitectTool added)
+  - Concurrent tool execution for read-only tools (asyncio.gather)
+  - Context injection: git status + directory structure + README in every prompt
+  - AI-powered compact (summarize before clearing)
+  - Cost tracking with per-call breakdown
+  - FileEditTool uses old_string/new_string with single-match validation
+  - Formal permission system
+
+PRESERVED (unchanged from original):
+  - Cognee memory integration (remember/recall via cognee.add/cognify/search)
+  - litellm as LLM backend with model hot-swapping
+  - Error handling and fallback without tools
+  - Subagent spawning mechanism
+"""
+
 import os
 import sys
-import subprocess
 import asyncio
-import uuid
-import requests
 import json
+import uuid
+import time
+import warnings
+
 import litellm
 import cognee
 
-# Define JSON Schema Tools for Litellm (Universal Format)
-omni_tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read the contents of a local file.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute or relative path to the file."}
-                },
-                "required": ["path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Create a completely new file and write content to it. For existing files, you MUST use edit_file instead to save tokens.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute or relative path to the file."},
-                    "content": {"type": "string", "description": "The full text content to write."}
-                },
-                "required": ["path", "content"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_file",
-            "description": "Surgically edit an existing file by replacing a specific block of text. Use this instead of write_file for existing files to save tokens.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute or relative path to the file."},
-                    "target_content": {"type": "string", "description": "The exact block of text to be replaced. Must match exactly, including whitespace."},
-                    "replacement_content": {"type": "string", "description": "The new block of text to insert in its place."}
-                },
-                "required": ["path", "target_content", "replacement_content"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_command",
-            "description": "Execute a shell command (e.g., npm run build, ls, pytest).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "The shell command to run."}
-                },
-                "required": ["command"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "remember",
-            "description": "Store a fact, user preference, or project context into long-term Cognee graph memory.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "fact": {"type": "string", "description": "The fact or context to remember."}
-                },
-                "required": ["fact"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "recall",
-            "description": "Search long-term Cognee graph memory for past context or facts.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "What you want to search for."}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "spawn_subagent",
-            "description": "Spawns a detached background sub-agent to work on a task independently. The sub-agent runs silently and uses 'remember' to save its final report to Cognee.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_description": {"type": "string", "description": "A very detailed description of what the sub-agent needs to accomplish."}
-                },
-                "required": ["task_description"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_web",
-            "description": "Search the internet using SearXNG. Use this to find up-to-date information, documentation, or solutions.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The search query string."}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "think",
-            "description": "Use this tool to think out loud, reason through complex bugs, or architect a plan before taking action. Your thoughts will be saved to memory.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "thought": {"type": "string", "description": "Your detailed reasoning or architectural plan."}
-                },
-                "required": ["thought"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_codebase",
-            "description": "Search the local codebase for a text pattern or regex (similar to grep). Use this to quickly find where functions or variables are defined without reading whole files.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The regex or text pattern to search for."},
-                    "directory": {"type": "string", "description": "The directory to search in (use '.' for root)."}
-                },
-                "required": ["query", "directory"]
-            }
-        }
-    }
-]
+# Suppress verbose logs
+warnings.filterwarnings("ignore", category=UserWarning)
+
+from src.tools import get_json_schemas, get_all_tools
+from src.context import get_context, format_system_prompt_with_context, invalidate_context_cache
+from src.cost_tracker import add_to_total_cost, get_tracker
+from src.permissions import check_tool_permission
+
+
+SYSTEM_INSTRUCTION = (
+    "You are Omni-Dev, a highly capable autonomous coding agent with access to powerful tools. "
+    "You can read/write files, run commands, search the codebase, manage memory, spawn sub-agents, "
+    "browse the web, think through complex problems, list directories, find files with glob patterns, "
+    "read/edit Jupyter notebooks, and generate architectural plans.\n\n"
+    "CRITICAL RULES:\n"
+    "1. NEVER guess file paths. Use list_dir or glob_files to verify paths first.\n"
+    "2. ALWAYS read a file before editing it (so you have the exact content).\n"
+    "3. When editing, use old_string/new_string with enough context to be unique.\n"
+    "4. Use think to reason through complex problems before coding.\n"
+    "5. Use remember to save important findings for future sessions.\n"
+    "6. Use spawn_subagent for long background tasks.\n"
+    "7. Analyze errors and try alternative approaches instead of giving up.\n"
+    "8. Use architect to plan large features before implementing them."
+)
+
 
 class OmniDevAgent:
+    """
+    Main agentic loop.
+    Enhanced with scratch_repo features while preserving all Cognee memory integration.
+    """
+
     def __init__(self):
         self.model_name = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro")
-        
-        self.system_instruction = (
-            "You are Omni-Dev, a highly capable autonomous coding agent. "
-            "You have access to tools to read files, write files, run terminal commands, and use Cognee for long-term memory. "
-            "CRITICAL: NEVER guess file paths or URLs. You MUST use search_codebase or run_command('dir'/'ls') to verify a file exists before you attempt to edit or read it. "
-            "If a tool returns an error, analyze the error and try a different approach."
-        )
+        self.system_instruction = SYSTEM_INSTRUCTION
         self.messages = [{"role": "system", "content": self.system_instruction}]
-        self.session_tokens = 0
+        self._tool_instances = {tool.name: tool for tool in get_all_tools()}
+        self._tool_schemas = get_json_schemas()
+        self._context: dict = {}
 
-    def get_token_usage(self):
-        return self.session_tokens
+    def get_token_usage(self) -> int:
+        return get_tracker().total_tokens
+
+    def get_cost_summary(self) -> str:
+        return get_tracker().get_summary()
 
     def compact_session(self):
-        """Resets the short-term chat memory to save tokens while keeping long-term graph memory."""
+        """Simple reset (use AI compact via compact_command for smart version)."""
         self.messages = [{"role": "system", "content": self.system_instruction}]
+        self._context = {}
+        invalidate_context_cache()
 
-    # --- Tool Implementations ---
-    def _tool_read_file(self, path: str) -> str:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read()
-        except Exception as e:
-            return f"Error reading file: {e}"
-
-    def _tool_write_file(self, path: str, content: str) -> str:
-        try:
-            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
-            return f"Successfully wrote to {path}"
-        except Exception as e:
-            return f"Error writing file: {e}"
-
-    async def _tool_edit_file(self, path: str, target_content: str, replacement_content: str) -> str:
-        try:
-            if not os.path.exists(path):
-                return f"Error: File {path} does not exist. Use write_file to create it."
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-            if target_content not in content:
-                return "Error: target_content not found in file. Make sure your indentation and line breaks match exactly."
-            new_content = content.replace(target_content, replacement_content, 1)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(new_content)
-                
-            await cognee.add(f"Agent edited file {path}. Replaced:\n{target_content}\nWith:\n{replacement_content}", dataset_name="agent_telemetry")
-            await cognee.cognify()
-            
-            return f"Successfully edited {path} using smart chunk replacement."
-        except Exception as e:
-            return f"Error editing file: {e}"
-
-    async def _tool_run_command(self, command: str) -> str:
-        SAFE_COMMANDS = ["git status", "git diff", "git log", "git branch", "dir", "ls", "pwd", "tree", "date", "whoami", "npm run dev"]
-        
-        is_safe = False
-        cmd_lower = command.lower().strip()
-        for safe in SAFE_COMMANDS:
-            if cmd_lower.startswith(safe):
-                is_safe = True
-                break
-                
-        if not is_safe:
-            print(f"\n\033[91m[SECURITY WARNING] Omni-Dev wants to run a dangerous command:\033[0m {command}")
-            user_approval = input("\033[93mAllow this command? (y/n): \033[0m").strip().lower()
-            if user_approval != 'y':
-                return "Command execution rejected by user."
-
-        try:
-            result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
-            output = result.stdout + "\n" + result.stderr
-            
-            await cognee.add(f"Agent ran terminal command: {command}\nOutput: {output}", dataset_name="agent_telemetry")
-            await cognee.cognify()
-            
-            return output if output.strip() else "Command executed successfully with no output."
-        except subprocess.TimeoutExpired:
-            return "Command timed out."
-        except Exception as e:
-            return f"Error running command: {e}"
-
-    async def _tool_remember(self, fact: str) -> str:
-        try:
-            await cognee.add(fact, dataset_name="user_memory")
-            await cognee.cognify()
-            return "Fact successfully saved to long-term memory."
-        except Exception as e:
-            return f"Error saving memory: {e}"
-
-    async def _tool_recall(self, query: str) -> str:
-        try:
-            results = await cognee.search("SEARCH_TYPE_INSIGHTS", query_text=query)
-            if results:
-                return "\n".join(str(res) for res in results)
-            return "No relevant memories found."
-        except Exception as e:
-            return f"Error recalling memory: {e}"
-
-    def _tool_spawn_subagent(self, task_description: str) -> str:
-        try:
-            subagent_id = str(uuid.uuid4())[:8]
-            if os.name == 'nt':
-                CREATE_NO_WINDOW = 0x08000000
-                subprocess.Popen(
-                    [sys.executable, "subagent.py", task_description, subagent_id],
-                    creationflags=CREATE_NO_WINDOW,
-                    cwd=os.path.abspath(os.path.dirname(__file__))
-                )
-            else:
-                subprocess.Popen(
-                    [sys.executable, "subagent.py", task_description, subagent_id],
-                    start_new_session=True,
-                    cwd=os.path.abspath(os.path.dirname(__file__))
-                )
-            return f"Sub-agent '{subagent_id}' spawned successfully in the background. It will save its findings to memory when finished."
-        except Exception as e:
-            return f"Error spawning subagent: {e}"
-
-    def _tool_search_web(self, query: str) -> str:
-        try:
-            searxng_url = os.environ.get("SEARXNG_URL", "https://searx.be")
-            response = requests.get(
-                f"{searxng_url}/search",
-                params={"q": query, "format": "json"},
-                timeout=15
-            )
-            if response.status_code == 200:
-                results = response.json().get("results", [])
-                if not results:
-                    return "No results found."
-                formatted = [f"Title: {r.get('title')}\nURL: {r.get('url')}\nContent: {r.get('content')}" for r in results[:5]]
-                return "\n\n".join(formatted)
-            else:
-                return f"Search failed with status code {response.status_code}"
-        except Exception as e:
-            return f"Error searching the web: {e}"
-
-    async def _tool_think(self, thought: str) -> str:
-        await self._tool_remember(f"Thought Process: {thought}")
-        return "Thought logged to memory successfully."
-
-    def _tool_search_codebase(self, query: str, directory: str) -> str:
-        try:
-            import glob
-            import re
-            results = []
-            for filepath in glob.glob(os.path.join(directory, '**', '*.*'), recursive=True):
-                if 'node_modules' in filepath or '.git' in filepath or 'venv' in filepath:
-                    continue
-                try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        lines = f.readlines()
-                        for i, line in enumerate(lines):
-                            if re.search(query, line):
-                                results.append(f"{filepath}:{i+1}: {line.strip()}")
-                except:
-                    pass
-            if results:
-                return "\n".join(results[:50])
-            return "No matches found."
-        except Exception as e:
-            return f"Error searching codebase: {e}"
-
-    async def execute_task(self, prompt: str, progress_callback=None):
-        self.messages.append({"role": "user", "content": prompt})
-        
-        # Always fetch latest model in case user hot-swapped it
-        model_name = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro")
-        
-        while True:
+    async def _load_context(self) -> dict:
+        """Load and cache context (git status, directory structure, README)."""
+        if not self._context:
             try:
-                response = litellm.completion(
-                    model=model_name,
-                    messages=self.messages,
-                    tools=omni_tools,
-                    tool_choice="auto"
-                )
+                self._context = await get_context()
+            except Exception:
+                self._context = {}
+        return self._context
+
+    async def _execute_tool(self, tool_name: str, args: dict) -> str:
+        """Execute a single tool call."""
+        tool = self._tool_instances.get(tool_name)
+        if not tool:
+            return f"Unknown tool: {tool_name}"
+
+        # Check permissions
+        perm = await check_tool_permission(tool_name, args)
+        if not perm.allowed:
+            return f"Permission denied: {perm.message}"
+
+        try:
+            result = await tool.call(**args)
+            return str(result)
+        except TypeError as e:
+            # Handle missing/extra kwargs
+            return f"Tool call error (bad arguments for {tool_name}): {e}"
+        except Exception as e:
+            return f"Tool error ({tool_name}): {e}"
+
+    async def _execute_tools_concurrently(self, tool_calls: list) -> list:
+        """
+        Execute multiple read-only tool calls concurrently.
+        Mirrors runToolsConcurrently from scratch_repo/src/query.ts.
+        """
+        tasks = []
+        for tc in tool_calls:
+            func_name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments)
+            except Exception:
+                args = {}
+            tasks.append(self._execute_tool(func_name, args))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return [
+            (tc, str(r) if not isinstance(r, Exception) else f"Tool error: {r}")
+            for tc, r in zip(tool_calls, results)
+        ]
+
+    async def _execute_tools_serially(self, tool_calls: list, progress_callback=None) -> list:
+        """
+        Execute tool calls one at a time.
+        Mirrors runToolsSerially from scratch_repo/src/query.ts.
+        """
+        results = []
+        for tc in tool_calls:
+            func_name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments)
+            except Exception:
+                args = {}
+
+            if progress_callback:
+                progress_callback(func_name, args)
+
+            result = await self._execute_tool(func_name, args)
+            results.append((tc, result))
+
+        return results
+
+    def _all_read_only(self, tool_calls: list) -> bool:
+        """Check if all tool calls are read-only (can run concurrently)."""
+        for tc in tool_calls:
+            tool = self._tool_instances.get(tc.function.name)
+            if tool is None or not tool.is_read_only():
+                return False
+        return True
+
+    async def execute_task(self, prompt: str, progress_callback=None) -> str:
+        """
+        Main agentic loop.
+        Mirrors query() from scratch_repo/src/query.ts.
+        
+        Enhancements:
+        - Context injection (git status, directory structure)
+        - Concurrent tool execution for read-only tools
+        - Cost tracking per call
+        """
+        # Load and inject context into system prompt
+        context = await self._load_context()
+        full_system = format_system_prompt_with_context(self.system_instruction, context)
+
+        # Update system message with latest context
+        if self.messages and self.messages[0]["role"] == "system":
+            self.messages[0]["content"] = full_system
+        else:
+            self.messages.insert(0, {"role": "system", "content": full_system})
+
+        self.messages.append({"role": "user", "content": prompt})
+
+        # Always use latest model in case user hot-swapped it
+        model_name = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro")
+
+        # Agentic loop (mirrors while(true) in query.ts)
+        while True:
+            start_time = time.time()
+            try:
+                try:
+                    response = litellm.completion(
+                        model=model_name,
+                        messages=self.messages,
+                        tools=self._tool_schemas,
+                        tool_choice="auto",
+                    )
+                except litellm.exceptions.BadRequestError:
+                    # Fallback: try without tools (some models reject tool schemas)
+                    response = litellm.completion(
+                        model=model_name,
+                        messages=self.messages,
+                    )
+                    text = response.choices[0].message.content or ""
+                    return (
+                        f"*(Warning: `{model_name}` rejected the tool schema. "
+                        "Tools disabled. Switch to gpt-4o or gemini-1.5-pro for full capabilities.)*\n\n"
+                        + text
+                    )
+
             except Exception as e:
-                error_msg = getattr(e, 'message', '')
-                if not error_msg:
-                    error_msg = str(e)
-                if not error_msg or error_msg.strip() in ["GroqException -", "GroqException - "]:
-                    error_msg = repr(e)
-                    
+                error_msg = getattr(e, "message", str(e)) or repr(e)
                 if "403" in error_msg or "Permission" in error_msg:
-                    return f"🚨 **API Error:** Permission denied for `{model_name}`. Did you forget to configure your model? Try typing `/model ollama/llama3` or `/model groq/llama3-8192`.\n\n*Raw Error:* {error_msg}"
-                elif "Auth" in error_msg or "key" in error_msg.lower() or "401" in error_msg or "invalid_api_key" in error_msg:
-                    return f"🚨 **API Key Missing/Invalid:** The model `{model_name}` rejected the API key. Please set it using `/api_key <PROVIDER> <key>` (e.g. `/api_key GROQ gsk_...`).\n\n*Raw Error:* {error_msg}"
-                return f"🚨 **LLM Provider Error:** {error_msg}\n\n*Hint:* Ensure you have configured your model correctly using `/model <name>`. If using Groq, ensure the model exists (e.g., `groq/llama3-8192`, not qwen)."
-                
-            if hasattr(response, 'usage') and response.usage:
-                self.session_tokens += getattr(response.usage, 'total_tokens', 0)
-                
+                    return f"🚨 **API Permission Error:** `{model_name}` access denied.\n\n*Raw Error:* {error_msg}"
+                if any(k in error_msg.lower() for k in ["auth", "key", "401", "invalid_api_key"]):
+                    return f"🚨 **API Key Missing/Invalid for `{model_name}`.**\nUse `/api_key` to set it.\n\n*Raw Error:* {error_msg}"
+                return f"🚨 **LLM Error:** {error_msg}\n\n*Hint:* Use `/model` to switch providers."
+
+            # Track cost
+            duration_ms = round((time.time() - start_time) * 1000)
+            if hasattr(response, "usage") and response.usage:
+                u = response.usage
+                add_to_total_cost(
+                    model_name,
+                    getattr(u, "prompt_tokens", 0),
+                    getattr(u, "completion_tokens", 0),
+                    duration_ms,
+                )
+
             response_message = response.choices[0].message
-            
+
+            # Handle tool calls
             if response_message.tool_calls:
-                # Store assistant tool call request
+                # Store assistant's tool call message
                 self.messages.append(response_message.model_dump())
-                
-                for tool_call in response_message.tool_calls:
-                    func_name = tool_call.function.name
-                    try:
-                        args = json.loads(tool_call.function.arguments)
-                    except:
-                        args = {}
-                        
+
+                tool_calls = response_message.tool_calls
+
+                # Run read-only tools concurrently, others serially
+                # Mirrors query.ts runToolsConcurrently / runToolsSerially
+                if self._all_read_only(tool_calls):
+                    # Announce all tools at once (for concurrent mode)
                     if progress_callback:
-                        progress_callback(func_name, args)
+                        for tc in tool_calls:
+                            try:
+                                args = json.loads(tc.function.arguments)
+                            except Exception:
+                                args = {}
+                            progress_callback(tc.function.name, args)
+                    results = await self._execute_tools_concurrently(tool_calls)
+                else:
+                    results = await self._execute_tools_serially(tool_calls, progress_callback)
 
-                    # Execute the corresponding tool
-                    if func_name == "read_file":
-                        result = self._tool_read_file(**args)
-                    elif func_name == "write_file":
-                        result = self._tool_write_file(**args)
-                    elif func_name == "edit_file":
-                        result = await self._tool_edit_file(**args)
-                    elif func_name == "run_command":
-                        result = await self._tool_run_command(**args)
-                    elif func_name == "remember":
-                        result = await self._tool_remember(**args)
-                    elif func_name == "recall":
-                        result = await self._tool_recall(**args)
-                    elif func_name == "spawn_subagent":
-                        result = self._tool_spawn_subagent(**args)
-                    elif func_name == "search_web":
-                        result = self._tool_search_web(**args)
-                    elif func_name == "think":
-                        result = await self._tool_think(**args)
-                    elif func_name == "search_codebase":
-                        result = self._tool_search_codebase(**args)
-                    else:
-                        result = f"Unknown tool: {func_name}"
-
+                # Add all tool results to message history
+                for tc, result in results:
                     self.messages.append({
                         "role": "tool",
-                        "name": func_name,
-                        "tool_call_id": tool_call.id,
-                        "content": str(result)
+                        "name": tc.function.name,
+                        "tool_call_id": tc.id,
+                        "content": str(result),
                     })
+
             else:
+                # No tool calls — we have a final response
                 final_text = response_message.content or ""
                 self.messages.append({"role": "assistant", "content": final_text})
                 return final_text
