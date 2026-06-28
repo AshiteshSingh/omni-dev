@@ -14,6 +14,21 @@
 **Files Modified**:
 - `src/agent/core.py`: Line 305-312 - Added `disable_tools_for_model` check
 
+### 1b. **Ollama Cloud Model Name Normalization**
+**Problem**: User entering `ollama/gemma4:31b-cloud` would cause issues because:
+1. Ollama cloud doesn't recognize model size in cloud variant names
+2. The model name needs to be normalized before sending to API
+
+**Fixes**:
+- Added model name normalization for Ollama cloud models
+- Converts `ollama/gemma4:31b-cloud` -> `ollama/gemma4-cloud`
+- Converts `ollama/llama3:cloud` -> `ollama/llama3:cloud` (unchanged)
+- Applied in both interface.py and core.py for consistency
+
+**Files Modified**:
+- `src/cli/interface.py`: Line 528-540 - Cloud model name normalization
+- `src/agent/core.py`: Line 289-297 - Cloud model name normalization
+
 ### 2. **Fallback Handling Improvement**
 **Problem**: When fallback to non-tools mode was triggered, raw JSON from tool calls would leak into the UI.
 
@@ -64,21 +79,24 @@
 
 ## How To Use
 
-### For Gemma4 31b (or other tool-limited models):
-1. Switch to model: `/model ollama/gemma4:31b`
-2. You'll see a warning: "This model doesn't support tool use"
-3. The CLI will still work - just without file/command execution
-4. For full capabilities, use: `/model gpt-4o` or `/model groq/llama-3.3-70b-versatile`
+### For Gemma4 31b (Local Ollama):
+1. Make sure `ollama serve` is running
+2. Switch to model: `/model ollama/gemma4:31b` (NOT `ollama/gemma4:31b-cloud`)
+3. You'll see a warning: "This model doesn't support tool use"
+4. The CLI will still work - just without file/command execution
+5. For full capabilities, use: `/model gpt-4o` or `/model groq/llama-3.3-70b-versatile`
 
-### For Ollama Cloud:
-1. Set model: `/model ollama/llama3:cloud`
-2. Set API key: `/api_key 10` (Ollama Cloud API Key)
+### For Ollama Cloud (Gemma4 Cloud):
+⚠️ **NOTE:** Ollama Cloud requires proper setup!
+1. First set your Ollama Cloud API key: `/api_key 10` (Ollama Cloud API Key)
+2. Then switch to model: `/model ollama/gemma4-cloud` (NOT `ollama/gemma4:31b-cloud`)
 3. The system will automatically detect cloud and set the correct API base
+4. You'll see: "This model doesn't support tool use"
 
-### For Local Ollama:
-1. Set model: `/model ollama/llama3`
-2. Make sure `ollama serve` is running
-3. The system will use `http://localhost:11434` by default
+**Important Model Name Formats:**
+- Local: `ollama/gemma4:31b` (no cloud)
+- Cloud: `ollama/gemma4-cloud` (without size indicator)
+- NOT: `ollama/gemma4:31b-cloud` (this will be auto-corrected to `ollama/gemma4-cloud`)
 
 ### For Diagnostics:
 Run `/doctor` to see:
@@ -86,6 +104,30 @@ Run `/doctor` to see:
 - Ollama server status (if using Ollama)
 - All API keys configuration
 - Full environment diagnostics
+
+### Troubleshooting Hangs/Timeouts:
+
+If the CLI seems to hang after entering a message:
+
+1. **Check your model name format**:
+   - Use `/model` to check current model
+   - Make sure it follows correct format (see above)
+
+2. **For Ollama models**:
+   - Local: Check if `ollama serve` is running
+   - Cloud: Check if API key is set with `/api_key`
+   - Run `/doctor` to see connection status
+
+3. **For tool-limited models** (Gemma, Mistral):
+   - These don't support complex tool schemas
+   - Messages will work but without file/command execution
+   - They may take longer to respond
+   - Consider switching to `gpt-4o` for full features
+
+4. **If still hanging**:
+   - Press Ctrl+C to interrupt
+   - Switch to a different model: `/model gpt-4o`
+   - Run `/doctor` to diagnose environment issues
 
 ## Testing
 

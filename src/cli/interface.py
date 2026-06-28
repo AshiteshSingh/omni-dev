@@ -527,6 +527,17 @@ async def main():
                     
                     while "//" in new_model:
                         new_model = new_model.replace("//", "/")
+                    
+                    # Fix Ollama model names - remove size from cloud variant
+                    # Example: ollama/gemma4:31b-cloud -> ollama/gemma4-cloud
+                    if new_model.startswith("ollama/") and "-cloud" in new_model.lower():
+                        # Extract model name before size indicator
+                        parts = new_model.split(":")
+                        if len(parts) > 1:
+                            # Has size indicator like gemma4:31b-cloud
+                            model_base = parts[0]  # ollama/gemma4
+                            # Get the cloud suffix from the size part
+                            new_model = model_base + "-cloud"
 
                     known_providers = ("groq/", "openai/", "anthropic/", "gemini/", "vertex_ai/", "openrouter/", "ollama/", "mistral/", "deepseek/", "huggingface/", "azure/", "cohere/")
                     if not any(new_model.lower().startswith(p) for p in known_providers):

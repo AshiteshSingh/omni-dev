@@ -287,6 +287,14 @@ class OmniDevAgent:
             
             while "//" in model_name:
                 model_name = model_name.replace("//", "/")
+            
+            # Fix Ollama model names - remove size from cloud variant
+            # Example: ollama/gemma4:31b-cloud -> ollama/gemma4-cloud
+            if model_name.startswith("ollama/") and "-cloud" in model_name.lower():
+                parts = model_name.split(":")
+                if len(parts) > 1:
+                    model_base = parts[0]
+                    model_name = model_base + "-cloud"
 
             known_providers = ("groq/", "openai/", "anthropic/", "gemini/", "vertex_ai/", "openrouter/", "ollama/", "mistral/", "deepseek/", "huggingface/", "azure/", "cohere/")
             if not any(model_name.lower().startswith(p) for p in known_providers):
@@ -347,6 +355,10 @@ class OmniDevAgent:
             # Only add API key if we're actually using cloud
             if use_cloud and api_key:
                 completion_kwargs["api_key"] = api_key
+            
+            # Validate Ollama cloud setup
+            if use_cloud and not api_key:
+                return f"🚨 **Ollama Cloud Error:** Model `{model_name}` requires cloud API key.\n\nUse `/api_key 10` to set `OLLAMA_API_KEY` first."
 
         # Agentic loop (mirrors while(true) in query.ts)
         MAX_ITERATIONS = 40
