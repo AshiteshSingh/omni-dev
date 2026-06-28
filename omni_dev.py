@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
 Omni-Dev entry point.
-Sets UTF-8 encoding before anything else to support emoji on Windows.
+
+Enforces UTF-8 terminal I/O (so emoji/glyphs render on Windows) before anything
+else, then hands off to the interactive interface. UTF-8 handling is delegated
+to the centralized ``src.cli.theme.enforce_utf8`` helper so there is a single
+source of truth (no more inline chcp/stdout-wrapping here).
 """
 import sys
-import os
 
-# ── Force UTF-8 output on Windows (fixes emoji rendering in cmd/PowerShell) ──
-if sys.platform == "win32":
-    import io
-    # Reconfigure stdout/stderr to UTF-8 with replacement for unsupported chars
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-    os.environ["PYTHONUTF8"] = "1"
-    os.environ["PYTHONIOENCODING"] = "utf-8"
+# ── Centralized Windows UTF-8 enforcement (must run before the Console is built) ──
+from src.cli import theme as _theme
+_theme.enforce_utf8()
 
 import asyncio
 from src.cli.interface import main

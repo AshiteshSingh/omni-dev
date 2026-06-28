@@ -5,7 +5,12 @@ Tracks cumulative API cost and token usage across the session.
 """
 import time
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
+
+# Fallback thresholds used when the global config cannot be read. These mirror
+# the Config_Defaults in src/config_store.py (costThreshold / tokenWarningThreshold).
+DEFAULT_COST_THRESHOLD: float = 5.0
+DEFAULT_TOKEN_WARNING_THRESHOLD: int = 1_000_000
 
 
 @dataclass
@@ -48,6 +53,10 @@ class CostTracker:
         self.total_output_tokens: int = 0
         self.total_duration_ms: int = 0
         self.call_history: List[CallRecord] = []
+        # Session-level acknowledgement of the cost threshold (Req 15.4). Once set,
+        # check_cost_warning() returns None for the remainder of the session even
+        # as cost continues to rise. Initialized from persisted config defensively.
+        self._cost_acknowledged: bool = self._load_persisted_acknowledgement()
 
     def _get_cost_rates(self, model: str) -> dict:
         """Get cost rates for a model, using fuzzy matching."""
@@ -111,6 +120,96 @@ class CostTracker:
             f"(↑{self.total_input_tokens:,} input / ↓{self.total_output_tokens:,} output)\n"
             f"⏱️  Total Time: {duration_s:.1f}s across {len(self.call_history)} API calls"
         )
+
+    def get_cost_threshold(self) -> float:
+        """Read the configured Cost_Threshold from global config, defensively.
+
+        Falls back to DEFAULT_COST_THRESHOLD if the config is unavailable or the
+        stored value is missing/invalid (Req 15.2).
+        """
+        try:
+            from src.config_store import get_global_config
+
+            value = get_global_config().get("costThreshold")
+            if value is None:
+                return DEFAULT_COST_THRESHOLD
+            return float(value)
+        except Exception:
+            return DEFAULT_COST_THRESHOLD
+
+    def get_token_warning_threshold(self) -> int:
+        """Read the configured Token_Warning threshold, defensively.
+
+        Falls back to DEFAULT_TOKEN_WARNING_THRESHOLD if the config is unavailable
+        or the stored value is missing/invalid (Req 15.3).
+        """
+        try:
+            from src.config_store import get_global_config
+
+            value = get_global_config().get("tokenWarningThreshold")
+            if value is None:
+                return DEFAULT_TOKEN_WARNING_THRESHOLD
+            return int(value)
+        except Exception:
+            return DEFAULT_TOKEN_WARNING_THRESHOLD
+
+    def _load_persisted_acknowledgement(self) -> bool:
+        """Read the persisted costThresholdAcknowledged flag, defensively (Req 15.4)."""
+        try:
+            from src.config_store import get_global_config
+
+            return bool(get_global_config().get("costThresholdAcknowledged", False))
+        except Exception:
+            return False
+
+    def check_cost_warning(self) -> Optional[str]:
+        """Return a cost warning when cumulative cost exceeds the Cost_Threshold.
+
+        Returns a warning string when cumulative session cost exceeds the configured
+        Cost_Threshold AND the threshold has not been acknowledged; otherwise None
+        (Req 15.2, 15.4 / Property 33).
+        """
+        if self._cost_acknowledged:
+            return None
+        threshold = self.get_cost_threshold()
+        if self.total_cost_usd > threshold:
+            return (
+                f"⚠️  Session cost ${self.total_cost_usd:.4f} USD has exceeded the "
+                f"configured threshold of ${threshold:.2f} USD."
+            )
+        return None
+
+    def check_token_warning(self) -> Optional[str]:
+        """Return a token-usage warning when cumulative tokens exceed the threshold.
+
+        Returns a warning string when cumulative session tokens exceed the configured
+        Token_Warning threshold; otherwise None (Req 15.3 / Property 33).
+        """
+        threshold = self.get_token_warning_threshold()
+        if self.total_tokens > threshold:
+            return (
+                f"⚠️  Session token usage {self.total_tokens:,} has exceeded the "
+                f"configured threshold of {threshold:,} tokens."
+            )
+        return None
+
+    def acknowledge_cost(self) -> None:
+        """Acknowledge the Cost_Threshold warning for the session (Req 15.4).
+
+        Marks the threshold acknowledged so check_cost_warning() returns None for the
+        rest of the session even as cost rises, and persists costThresholdAcknowledged
+        to the global config defensively (persistence failure is non-fatal).
+        """
+        self._cost_acknowledged = True
+        try:
+            from src.config_store import get_global_config, save_global_config
+
+            cfg = get_global_config()
+            cfg["costThresholdAcknowledged"] = True
+            save_global_config(cfg)
+        except Exception:
+            # Persistence is best-effort; the session-level flag still suppresses warnings.
+            pass
 
     def reset(self):
         """Reset cost tracking (e.g., on /compact)."""

@@ -16,6 +16,7 @@ import asyncio
 from typing import Any, Dict, Optional
 
 from .base_tool import BaseTool
+from .persistent_shell import get_shell
 
 # Commands that are completely banned (mirrors BashTool prompt.ts BANNED_COMMANDS)
 BANNED_COMMANDS = [
@@ -355,24 +356,34 @@ class BashTool(BaseTool):
                     output_parts.append(f"[Exit code: {proc.returncode}] — Process exited immediately (startup error).")
                 return "\n".join(output_parts) if output_parts else "Process exited immediately with no output."
             else:
-                result = subprocess.run(
-                    clean_command,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=effective_timeout,
-                    cwd=os.getcwd(),
+                # Route normal (non-background) commands through the session
+                # PersistentShell so cwd/env changes persist across invocations
+                # (Requirements 11.1-11.4). Killing/respawning on timeout keeps
+                # the shell usable for the next command (Requirement 11.5).
+                shell = get_shell()
+                loop = asyncio.get_event_loop()
+                shell_result = await loop.run_in_executor(
+                    None, lambda: shell.run(clean_command, timeout=effective_timeout)
                 )
-                stdout, _ = truncate_output(result.stdout or "")
-                stderr, _ = truncate_output(result.stderr or "")
+
+                if shell_result.timed_out:
+                    note = f"Command timed out after {effective_timeout}s."
+                    partial = (shell_result.stdout or "").strip()
+                    if partial:
+                        partial_t, _ = truncate_output(partial)
+                        return f"{note}\n{partial_t.strip()}"
+                    return note
+
+                stdout, _ = truncate_output(shell_result.stdout or "")
+                stderr, _ = truncate_output(shell_result.stderr or "")
 
                 output_parts = []
                 if stdout.strip():
                     output_parts.append(stdout.strip())
                 if stderr.strip():
                     output_parts.append(f"[stderr]\n{stderr.strip()}")
-                if result.returncode != 0:
-                    output_parts.append(f"[Exit code: {result.returncode}]")
+                if shell_result.exit_code != 0:
+                    output_parts.append(f"[Exit code: {shell_result.exit_code}]")
 
                 return "\n".join(output_parts) if output_parts else "Command executed successfully with no output."
 
