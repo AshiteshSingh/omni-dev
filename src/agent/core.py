@@ -314,16 +314,28 @@ class OmniDevAgent:
         if model_name.startswith("ollama/"):
             api_base = os.environ.get("OLLAMA_API_BASE")
             model_lower = model_name.lower()
-            is_cloud = any(k in model_lower for k in ["cloud", ":cloud", "-cloud"]) or (os.environ.get("OLLAMA_API_KEY") and os.environ.get("OLLAMA_API_KEY").strip())
-            if is_cloud and (not api_base or api_base == "http://localhost:11434"):
+            api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
+            
+            # Check if this is a cloud model
+            has_cloud_in_name = any(k in model_lower for k in ["cloud", ":cloud", "-cloud"])
+            
+            # Determine if we should use cloud
+            # Cloud if: model name contains "cloud" OR api_base is already set to cloud
+            use_cloud = has_cloud_in_name or (api_base and "ollama.com" in api_base)
+            
+            # If we're using cloud but API base is not set or is localhost, update it
+            if use_cloud and (not api_base or api_base == "http://localhost:11434"):
                 api_base = "https://ollama.com"
                 os.environ["OLLAMA_API_BASE"] = api_base
+            # If not cloud and no API base set, use localhost
             elif not api_base:
                 api_base = "http://localhost:11434"
+                os.environ["OLLAMA_API_BASE"] = api_base
             
             completion_kwargs["api_base"] = api_base
-            api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
-            if is_cloud and api_key:
+            
+            # Only add API key if we're actually using cloud
+            if use_cloud and api_key:
                 completion_kwargs["api_key"] = api_key
 
         # Agentic loop (mirrors while(true) in query.ts)

@@ -77,13 +77,18 @@ for key in list(os.environ.keys()):
         else:
             os.environ[key] = val
 
-if not os.environ.get("OLLAMA_API_BASE") or os.environ.get("OLLAMA_API_BASE") == "http://localhost:11434":
+# Don't automatically set OLLAMA_API_BASE here - let the agent core logic handle it based on actual model
+# Only set a default if absolutely nothing is configured
+if not os.environ.get("OLLAMA_API_BASE"):
+    # Check if we have any indication this should be cloud
     model = os.environ.get("OMNI_MODEL", "")
     api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
-    is_cloud_model = "cloud" in model.lower()
-    if api_key or is_cloud_model:
+    
+    # Only auto-set to cloud if BOTH: model has "cloud" AND we have an API key
+    # Otherwise default to local
+    if "cloud" in model.lower() and api_key:
         os.environ["OLLAMA_API_BASE"] = "https://ollama.com"
-    elif not os.environ.get("OLLAMA_API_BASE"):
+    else:
         os.environ["OLLAMA_API_BASE"] = "http://localhost:11434"
 
 def sync_cognee_config():
@@ -547,14 +552,17 @@ async def main():
                         pass
 
                     # Automatically set API base to cloud if switched to a cloud ollama model
-                    if new_model.startswith("ollama/") and "cloud" in new_model.lower():
-                        if not os.environ.get("OLLAMA_API_BASE") or os.environ.get("OLLAMA_API_BASE") == "http://localhost:11434":
-                            os.environ["OLLAMA_API_BASE"] = "https://ollama.com"
-                            try:
-                                from dotenv import set_key
-                                set_key(".env", "OLLAMA_API_BASE", "https://ollama.com")
-                            except Exception:
-                                pass
+                    if new_model.startswith("ollama/"):
+                        model_lower = new_model.lower()
+                        has_cloud_in_name = any(k in model_lower for k in ["cloud", ":cloud", "-cloud"])
+                        if has_cloud_in_name:
+                            if not os.environ.get("OLLAMA_API_BASE") or os.environ.get("OLLAMA_API_BASE") == "http://localhost:11434":
+                                os.environ["OLLAMA_API_BASE"] = "https://ollama.com"
+                                try:
+                                    from dotenv import set_key
+                                    set_key(".env", "OLLAMA_API_BASE", "https://ollama.com")
+                                except Exception:
+                                    pass
 
                     sync_cognee_config()
                     console.print(f"  [dim]└[/dim] [bold green]Model switched to:[/bold green] {new_model}")
@@ -611,13 +619,20 @@ async def main():
 
                 if key_value:
                     os.environ[provider_key] = key_value
-                    if provider_key == "OLLAMA_API_KEY" and (not os.environ.get("OLLAMA_API_BASE") or os.environ.get("OLLAMA_API_BASE") == "http://localhost:11434"):
-                        os.environ["OLLAMA_API_BASE"] = "https://ollama.com"
-                        try:
-                            from dotenv import set_key
-                            set_key(".env", "OLLAMA_API_BASE", "https://ollama.com")
-                        except Exception:
-                            pass
+                    # Don't automatically switch to cloud when setting OLLAMA_API_KEY
+                    # Let the user decide via /model command or keep using local
+                    # Only update if the current model is actually a cloud model
+                    if provider_key == "OLLAMA_API_KEY":
+                        current_model = os.environ.get("OMNI_MODEL", "").lower()
+                        if "cloud" in current_model and "ollama" in current_model:
+                            # Only switch to cloud if the current model is a cloud ollama model
+                            if not os.environ.get("OLLAMA_API_BASE") or os.environ.get("OLLAMA_API_BASE") == "http://localhost:11434":
+                                os.environ["OLLAMA_API_BASE"] = "https://ollama.com"
+                                try:
+                                    from dotenv import set_key
+                                    set_key(".env", "OLLAMA_API_BASE", "https://ollama.com")
+                                except Exception:
+                                    pass
                     try:
                         from dotenv import set_key
                         set_key(".env", provider_key, key_value)
