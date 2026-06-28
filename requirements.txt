@@ -25,3 +25,7 @@ asyncio
 # API Framework (optional, for server mode)
 fastapi
 uvicorn
+
+# Testing (offline test suite: pytest + Hypothesis property-based tests, Req 8.8)
+pytest
+hypothesis
