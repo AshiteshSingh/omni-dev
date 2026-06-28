@@ -1,43 +1,52 @@
 """
 core.py - Enhanced OmniDevAgent
 
-This is the central agent engine. It has been significantly enhanced by converting
-features from the TypeScript scratch_repo:
+This is the central agent engine. The agentic loop (``execute_task``) mirrors the
+reference ``query.ts`` loop and is built on the consolidated service modules:
 
-NEW FEATURES (ported from scratch_repo):
-  - All 15 tools now available (GlobTool, LSTool, NotebookTools, ArchitectTool added)
-  - Concurrent tool execution for read-only tools (asyncio.gather)
-  - Context injection: git status + directory structure + README in every prompt
-  - AI-powered compact (summarize before clearing)
-  - Cost tracking with per-call breakdown
-  - FileEditTool uses old_string/new_string with single-match validation
-  - Formal permission system
+  - ``src.model_router``  : single authoritative model normalization + routing
+                            (local vs cloud Ollama, ``ollama_chat/`` prefix, keys,
+                            timeouts) and the injectable ``completion_fn``.
+  - ``src.tool_policy``   : per-model decision on whether to send tool schemas
+                            (replaces the old blanket ``disable_tools_for_model``).
+  - ``src.agent.validation`` : JSON-schema + value-level validation of model args.
+  - ``src.agent.tool_parser``: clean fallback parser for text tool-calls
+                            (replaces the inline balanced-brace scanner,
+                            ``repair_json_string`` and ``_clean_final_text``).
 
-PRESERVED (unchanged from original):
-  - Cognee memory integration (remember/recall via cognee.add/cognify/search)
-  - litellm as LLM backend with model hot-swapping
-  - Error handling and fallback without tools
-  - Subagent spawning mechanism
+Loop behavior faithfully mirrors the reference:
+  - schema validation before execution, value-level checks, unknown-tool handling,
+  - bounded concurrency for read-only tools vs. serial for mutating tools,
+  - ordered tool results, permission gating with autonomous bypass,
+  - interrupt/cancellation via ``asyncio.Event``, head/tail result truncation.
+
+PRESERVED:
+  - Cognee memory integration (remember/recall via the memory tools)
+  - Context injection (git status + directory structure + README)
+  - Cost tracking, progress_callback announcements
 """
 
 import os
-import sys
 import asyncio
 import json
-import uuid
+import inspect
 import time
 import warnings
-
-import litellm
-import cognee
 
 # Suppress verbose logs
 warnings.filterwarnings("ignore", category=UserWarning)
 
 from src.tools import get_json_schemas, get_all_tools
-from src.context import get_context, format_system_prompt_with_context, invalidate_context_cache
+from src.context import (
+    get_context,
+    format_system_prompt_with_context,
+    invalidate_context_cache,
+)
 from src.cost_tracker import add_to_total_cost, get_tracker
-from src.permissions import check_tool_permission
+from src import model_router
+from src import tool_policy
+from src.agent.validation import validate_tool_args, format_validation_error_content
+from src.agent import tool_parser
 
 
 SYSTEM_INSTRUCTION = (
@@ -74,83 +83,16 @@ SYSTEM_INSTRUCTION = (
 )
 
 
-
-def _clean_final_text(text: str) -> str:
-    """
-    Clean up the agent's final response text before showing it to the user.
-
-    Some open-source models (e.g. Ollama/Gemma) wrap their last answer in a JSON
-    tool-call block even when they just want to say "I'm done".  When that happens
-    the raw JSON leaks into the UI.  This function:
-    1. If the text is a bare think/summary JSON object, extracts the inner
-       human-readable text from the 'thought' / 'summary' / 'content' field.
-    2. Strips residual ``` fences around JSON blobs.
-    3. Otherwise returns the text unchanged.
-    """
-    import json, re
-    if not text:
-        return text
-    t = text.strip()
-    if "Tool Calls:" in t:
-        t = t.split("Tool Calls:")[0].strip()
-    if "```tool" in t:
-        t = t.split("```tool")[0].strip()
-    t = re.sub(r'```(?:json|tool)?\s*[\[\{].*?[\]\}]\s*```', '', t, flags=re.DOTALL).strip()
-    if not t:
-        return ""
-    # Case 1: entire response is a JSON object like {"name": "think", "arguments": {...}}
-    if t.startswith("{") and "\"name\"" in t and "\"arguments\"" in t:
-        try:
-            obj = json.loads(t)
-            args = obj.get("arguments", {})
-            if isinstance(args, str):
-                args = json.loads(args)
-            # Try common field names for human-readable content
-            for field in ("thought", "summary", "content", "message", "text", "result"):
-                if field in args:
-                    return str(args[field]).strip()
-            # Last resort: just return everything in args as readable text
-            return "\n".join(f"**{k}:** {v}" for k, v in args.items())
-        except Exception:
-            pass
-    # Case 2: response is a JSON array of tool calls
-    if t.startswith("[") and "\"name\"" in t and "\"arguments\"" in t:
-        try:
-            items = json.loads(t)
-            parts = []
-            for item in items:
-                args = item.get("arguments", {})
-                if isinstance(args, str):
-                    args = json.loads(args)
-                for field in ("thought", "summary", "content", "message", "text", "result"):
-                    if field in args:
-                        parts.append(str(args[field]).strip())
-                        break
-            if parts:
-                return "\n\n".join(parts)
-        except Exception:
-            pass
-    # Case 3: response starts with a markdown ```json fence containing only a tool call
-    m = re.match(r'^```(?:json)?\s*(\{.*?\})\s*```\s*$', t, re.DOTALL)
-    if m:
-        try:
-            obj = json.loads(m.group(1))
-            if "name" in obj and "arguments" in obj:
-                args = obj["arguments"]
-                if isinstance(args, str):
-                    args = json.loads(args)
-                for field in ("thought", "summary", "content", "message", "text", "result"):
-                    if field in args:
-                        return str(args[field]).strip()
-        except Exception:
-            pass
-    return text
+# Loop bounds — mirror the reference query.ts constants.
+MAX_ITERATIONS = 40
+MAX_TOOL_USE_CONCURRENCY = 10
+MAX_TOOL_RESULT_CHARS = 10_000
 
 
 class OmniDevAgent:
     """
-    Main agentic loop.
-    Enhanced with scratch_repo features while preserving all Cognee memory integration.
+    Main agentic loop. Mirrors query() from scratch_repo/src/query.ts using the
+    consolidated router / policy / validation / parser modules.
     """
 
     def __init__(self):
@@ -171,6 +113,18 @@ class OmniDevAgent:
         self._tool_instances = {tool.name: tool for tool in get_all_tools()}
         self._tool_schemas = get_json_schemas()
         self._context: dict = {}
+
+        # Autonomous mode bypasses the Permission_Check (Req 7.10). May also be
+        # toggled via the OMNI_AUTONOMOUS environment variable.
+        self.autonomous = False
+        # Injected permission callback (the reference ``canUseTool``). The
+        # interface layer sets this to an interactive approve/deny/remember
+        # prompt. When None, the loop falls back to the permissions module.
+        self.can_use_tool = None
+
+    # ------------------------------------------------------------------ #
+    # Session helpers
+    # ------------------------------------------------------------------ #
 
     def get_token_usage(self) -> int:
         return get_tracker().total_tokens
@@ -193,87 +147,282 @@ class OmniDevAgent:
                 self._context = {}
         return self._context
 
-    async def _execute_tool(self, tool_name: str, args: dict) -> str:
-        """Execute a single tool call."""
-        tool = self._tool_instances.get(tool_name)
-        if not tool:
-            return f"Unknown tool: {tool_name}"
+    # ------------------------------------------------------------------ #
+    # Autonomous mode / interrupt helpers
+    # ------------------------------------------------------------------ #
 
-        # Check permissions
-        perm = await check_tool_permission(tool_name, args)
-        if not perm.allowed:
-            return f"Permission denied: {perm.message}"
+    def _is_autonomous(self) -> bool:
+        """True when Autonomous_Mode is enabled (attribute or OMNI_AUTONOMOUS)."""
+        if getattr(self, "autonomous", False):
+            return True
+        val = os.environ.get("OMNI_AUTONOMOUS", "").strip().lower()
+        return val in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _aborted(abort_event) -> bool:
+        """True when an interrupt has been requested via the abort event."""
+        try:
+            return abort_event is not None and abort_event.is_set()
+        except Exception:
+            return False
+
+    def _interrupt_return(self) -> str:
+        """Append a benign assistant message so history stays consistent (Req 7.12)."""
+        message = (
+            "⚠️ **Interrupted.** The task was stopped before completion. "
+            "You can issue a new request to continue."
+        )
+        # Only append if the last message isn't already a dangling tool-call
+        # assistant message; the loop guarantees we never reach here with one.
+        self.messages.append({"role": "assistant", "content": message})
+        return message
+
+    @staticmethod
+    def _truncate_result(content) -> str:
+        """Head/tail truncate oversized tool result content (Req 7.13)."""
+        if content is None:
+            return ""
+        content = str(content)
+        if len(content) <= MAX_TOOL_RESULT_CHARS:
+            return content
+        head_len = MAX_TOOL_RESULT_CHARS // 2
+        tail_len = MAX_TOOL_RESULT_CHARS - head_len
+        omitted = len(content) - (head_len + tail_len)
+        return (
+            content[:head_len]
+            + f"\n\n... [{omitted} characters truncated] ...\n\n"
+            + content[len(content) - tail_len:]
+        )
+
+    # ------------------------------------------------------------------ #
+    # Permission gating
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _interpret_permission(result):
+        """Normalize a permission-check return value into ``(allowed, reason)``."""
+        if result is None:
+            return True, ""
+        if isinstance(result, bool):
+            return result, "" if result else "denied by permission check"
+        if isinstance(result, (tuple, list)) and result:
+            allowed = bool(result[0])
+            reason = str(result[1]) if len(result) >= 2 and result[1] else ""
+            return allowed, reason or ("" if allowed else "denied by permission check")
+        if isinstance(result, dict):
+            allowed = bool(result.get("allowed", result.get("ok", False)))
+            reason = str(result.get("message", result.get("reason", "")) or "")
+            return allowed, reason or ("" if allowed else "denied by permission check")
+        # Duck-typed PermissionResult-like object.
+        allowed_attr = getattr(result, "allowed", getattr(result, "ok", None))
+        if allowed_attr is not None:
+            reason = getattr(result, "message", "") or getattr(result, "reason", "") or ""
+            allowed = bool(allowed_attr)
+            return allowed, str(reason) or ("" if allowed else "denied by permission check")
+        return bool(result), "" if result else "denied by permission check"
+
+    async def _check_permission(self, tool, tool_name: str, args: dict):
+        """Run the Permission_Check, preferring the injected ``can_use_tool``.
+
+        Returns ``(allowed, reason)``. Tolerant of differing callback/module
+        signatures so it keeps working with the current permissions module
+        (which exposes ``check_tool_permission``) and any future rebuild.
+        """
+        callback = getattr(self, "can_use_tool", None)
+        if callback is not None:
+            try:
+                # Try the richest signature first, then degrade gracefully.
+                try:
+                    result = callback(tool, args)
+                except TypeError:
+                    try:
+                        result = callback(tool_name, args)
+                    except TypeError:
+                        result = callback(tool_name)
+                if inspect.isawaitable(result):
+                    result = await result
+                return self._interpret_permission(result)
+            except Exception as exc:
+                return False, f"permission check failed: {exc}"
+
+        # Fall back to the permissions module (currently exposes
+        # check_tool_permission). Import defensively and tolerate signature drift.
+        try:
+            from src import permissions as _permissions
+        except Exception:
+            return True, ""
+
+        check = getattr(_permissions, "has_permission", None) or getattr(
+            _permissions, "check_tool_permission", None
+        )
+        if check is None:
+            return True, ""
 
         try:
+            try:
+                result = check(tool_name, args)
+            except TypeError:
+                try:
+                    result = check(tool, args)
+                except TypeError:
+                    result = check(tool_name)
+            if inspect.isawaitable(result):
+                result = await result
+            return self._interpret_permission(result)
+        except Exception as exc:
+            return False, f"permission check failed: {exc}"
+
+    # ------------------------------------------------------------------ #
+    # Tool execution
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _parse_args(tc) -> dict:
+        raw = tc.function.arguments
+        if isinstance(raw, dict):
+            return raw
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    async def _process_tool_call(self, tc, index: int):
+        """Validate, gate, and execute a single tool call.
+
+        Returns ``(index, tc, content, is_error)``. Never raises: tool errors are
+        captured and returned as flagged error results so the loop continues
+        (Req 6.3, 7.9).
+        """
+        tool_name = tc.function.name
+        args = self._parse_args(tc)
+
+        # Unknown tool (Req 7.4).
+        tool = self._tool_instances.get(tool_name)
+        if tool is None:
+            return index, tc, f"Error: No such tool available: {tool_name}", True
+
+        # Schema + value-level validation BEFORE execution (Req 7.1, 7.2, 7.3).
+        validation = validate_tool_args(tool, args)
+        if not validation.ok:
+            return index, tc, format_validation_error_content(validation), True
+
+        # Permission gating unless Autonomous_Mode (Req 7.8, 7.9, 7.10).
+        if not self._is_autonomous():
+            allowed, reason = await self._check_permission(tool, tool_name, args)
+            if not allowed:
+                detail = reason or "denied"
+                return index, tc, f"Permission denied: {detail}", True
+
+        # Execute, capturing any error (Req 6.3, 7.9).
+        try:
             result = await tool.call(**args)
-            return str(result)
-        except TypeError as e:
-            # Handle missing/extra kwargs
-            return f"Tool call error (bad arguments for {tool_name}): {e}"
-        except Exception as e:
-            return f"Tool error ({tool_name}): {e}"
+            return index, tc, str(result), False
+        except TypeError as exc:
+            return index, tc, f"Tool call error (bad arguments for {tool_name}): {exc}", True
+        except Exception as exc:
+            return index, tc, f"Tool error ({tool_name}): {exc}", True
 
-    async def _execute_tools_concurrently(self, tool_calls: list) -> list:
-        """
-        Execute multiple read-only tool calls concurrently.
-        Mirrors runToolsConcurrently from scratch_repo/src/query.ts.
-        """
-        tasks = []
-        for tc in tool_calls:
-            func_name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments)
-            except Exception:
-                args = {}
-            tasks.append(self._execute_tool(func_name, args))
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        return [
-            (tc, str(r) if not isinstance(r, Exception) else f"Tool error: {r}")
-            for tc, r in zip(tool_calls, results)
-        ]
-
-    async def _execute_tools_serially(self, tool_calls: list, progress_callback=None) -> list:
-        """
-        Execute tool calls one at a time.
-        Mirrors runToolsSerially from scratch_repo/src/query.ts.
-        """
-        results = []
-        for tc in tool_calls:
-            func_name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments)
-            except Exception:
-                args = {}
-
-            result = await self._execute_tool(func_name, args)
-            results.append((tc, result))
-
-        return results
-
-    def _all_read_only(self, tool_calls: list) -> bool:
-        """Check if all tool calls are read-only (can run concurrently)."""
+    def _all_read_only(self, tool_calls) -> bool:
+        """True only if every requested tool is a known Read_Only_Tool (Req 7.5)."""
         for tc in tool_calls:
             tool = self._tool_instances.get(tc.function.name)
             if tool is None or not tool.is_read_only():
                 return False
         return True
 
-    async def execute_task(self, prompt: str, progress_callback=None) -> str:
+    async def _execute_tools_concurrently(self, tool_calls) -> list:
+        """Run read-only tool calls concurrently with a bounded semaphore (Req 7.6)."""
+        semaphore = asyncio.Semaphore(MAX_TOOL_USE_CONCURRENCY)
+
+        async def run_one(i, tc):
+            async with semaphore:
+                return await self._process_tool_call(tc, i)
+
+        results = await asyncio.gather(
+            *(run_one(i, tc) for i, tc in enumerate(tool_calls))
+        )
+        return list(results)
+
+    async def _execute_tools_serially(self, tool_calls) -> list:
+        """Run tool calls one at a time, in order."""
+        results = []
+        for i, tc in enumerate(tool_calls):
+            results.append(await self._process_tool_call(tc, i))
+        return results
+
+    # ------------------------------------------------------------------ #
+    # Model invocation
+    # ------------------------------------------------------------------ #
+
+    def _build_kwargs(self, decision, include_tools: bool) -> dict:
+        kwargs = {
+            "model": decision.canonical_model,
+            "messages": self.messages,
+            "timeout": decision.timeout,
+        }
+        if include_tools:
+            kwargs["tools"] = self._tool_schemas
+            kwargs["tool_choice"] = "auto"
+        if decision.api_base:
+            kwargs["api_base"] = decision.api_base
+        if decision.api_key:
+            kwargs["api_key"] = decision.api_key
+        return kwargs
+
+    @staticmethod
+    def _is_tool_rejection(exc) -> bool:
+        """Heuristic: did a request fail because tool schemas were rejected? (Req 2.4)"""
+        text = str(getattr(exc, "message", "") or str(exc)).lower()
+        name = type(exc).__name__.lower()
+        if "badrequest" in name or "400" in name:
+            return True
+        return any(
+            k in text
+            for k in ("400", "bad request", "tool", "function", "ollamaexception")
+        )
+
+    @staticmethod
+    def _classify_error(exc, model_name: str) -> str:
+        """Map a request exception to a descriptive user-facing error (Req 6.1, 6.2)."""
+        error_msg = getattr(exc, "message", "") or str(exc) or repr(exc)
+        low = error_msg.lower()
+        if any(k in error_msg for k in ["10061", "Connection refused", "actively refused", "Failed to connect"]):
+            return (
+                f"🚨 **Ollama / Local Server Offline (`{model_name}`):** Could not connect to the local API server.\n\n"
+                "*Fix:* If using Ollama, open a new terminal and run `ollama serve`. Or type `/model` to switch to a "
+                "cloud provider (e.g., `groq/llama-3.3-70b-versatile`, `gemini/gemini-2.5-pro`, or `openai/gpt-4o`)."
+            )
+        if "403" in error_msg or "permission" in low or "access denied" in low:
+            return f"🚨 **API Permission Error:** `{model_name}` access denied.\n\n*Raw Error:* {error_msg}"
+        if any(k in low for k in ["auth", "api key", "api_key", "401", "invalid_api_key", "unauthorized"]):
+            return f"🚨 **API Key Missing/Invalid for `{model_name}`.**\nUse `/api_key` to set it.\n\n*Raw Error:* {error_msg}"
+        if "tool" in low or "function" in low:
+            return (
+                f"🚨 **Tool Schema Error:** Model `{model_name}` had an issue with tool definitions.\n\n"
+                f"This model may not support function calling. Try a different model with `/model`.\n\n*Raw Error:* {error_msg}"
+            )
+        return f"🚨 **LLM Error:** {error_msg}\n\n*Hint:* Use `/model` to switch providers."
+
+    # ------------------------------------------------------------------ #
+    # The agentic loop
+    # ------------------------------------------------------------------ #
+
+    async def execute_task(self, prompt, progress_callback=None, abort_event=None) -> str:
         """
-        Main agentic loop.
-        Mirrors query() from scratch_repo/src/query.ts.
-        
-        Enhancements:
-        - Context injection (git status, directory structure)
-        - Concurrent tool execution for read-only tools
-        - Cost tracking per call
+        Main agentic loop. Mirrors query() from scratch_repo/src/query.ts.
+
+        Routes through the Model Router + Tool Capability Policy, calls the model
+        via the injectable ``completion_fn``, validates/gates/executes tool calls
+        (concurrent for read-only, serial otherwise), orders and truncates the
+        results, supports interrupt and the text-tool-call fallback, and iterates
+        until a Final_Response or the iteration bound.
         """
-        # Load and inject context into system prompt
+        # --- Context injection (preserved) ---
         context = await self._load_context()
         full_system = format_system_prompt_with_context(self.system_instruction, context)
-
-        # Update system message with latest context
         if self.messages and self.messages[0]["role"] == "system":
             self.messages[0]["content"] = full_system
         else:
@@ -281,335 +430,170 @@ class OmniDevAgent:
 
         self.messages.append({"role": "user", "content": prompt})
 
-        # Always use latest model in case user hot-swapped it
-        model_name = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro").strip()
-        if model_name:
-            while "//" in model_name:
-                model_name = model_name.replace("//", "/")
-            if model_name.lower().startswith("model "):
-                model_name = model_name[6:].strip()
-            elif model_name.lower().startswith("models/"):
-                model_name = model_name[7:].strip()
-            elif model_name.lower().startswith("ollama "):
-                model_name = "ollama/" + model_name[7:].strip().lstrip("/")
-            
-            while "//" in model_name:
-                model_name = model_name.replace("//", "/")
-            
-            # Fix Ollama model names - only strip size tag for LOCAL ollama models
-            # Cloud variants like ollama/gemma4:31b-cloud keep their tag for the cloud API
-            # Local models like ollama/llama3:8b -> ollama/llama3 (litellm handles it)
-            if model_name.startswith("ollama/") and ":" in model_name:
-                model_lower_check = model_name.lower()
-                is_cloud_variant = any(k in model_lower_check for k in ["-cloud", ":cloud"])
-                if not is_cloud_variant:
-                    # Strip size tag for local models only
-                    model_name = model_name.split(":")[0]
+        # --- Routing via the Model Router (Req 5.2) ---
+        raw_model = os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro")
+        decision = model_router.route(raw_model, os.environ)
 
-            known_providers = ("groq/", "openai/", "anthropic/", "gemini/", "vertex_ai/", "openrouter/", "ollama/", "mistral/", "deepseek/", "huggingface/", "azure/", "cohere/")
-            if not any(model_name.lower().startswith(p) for p in known_providers):
-                lower_m = model_name.lower()
-                if "/" in model_name:
-                    model_name = "openrouter/" + model_name
-                elif "oss" in lower_m or any(k in lower_m for k in ["llama", "mixtral", "gemma", "whisper"]):
-                    model_name = "groq/" + model_name
-                elif "gpt" in lower_m or "o1" in lower_m or "o3" in lower_m:
-                    model_name = "openai/" + model_name
-                elif "claude" in lower_m:
-                    model_name = "anthropic/" + model_name
-                elif "gemini" in lower_m:
-                    model_name = "gemini/" + model_name
-                elif any(k in lower_m for k in ["glm", "qwen", "deepseek", "phi", "yi"]):
-                    model_name = "openrouter/" + model_name
+        # Routing error (e.g. cloud Ollama without a key) — return WITHOUT calling
+        # the backend (Req 1.5).
+        if decision.error:
+            return f"🚨 **Configuration Error:** {decision.error}"
 
-        # Determine if this model has known limitations with tool schemas
-        model_lower = model_name.lower()
-        # Cloud Ollama models (with "cloud" in name) are hosted APIs that CAN support tool schemas.
-        # Explicitly treat cloud ollama as a capable model regardless of model name keywords.
-        is_cloud_ollama = model_lower.startswith("ollama/") and any(
-            k in model_lower for k in ["cloud", "-cloud", ":cloud"]
-        )
-        is_local_ollama = model_lower.startswith("ollama/") and not is_cloud_ollama
-        # Disable tools for: local ollama, or known-limited open source models (unless it's cloud ollama)
-        disable_tools_for_model = not is_cloud_ollama and (
-            is_local_ollama or any(k in model_lower for k in [
-                "gemma", "mistral", "neural-chat", "orca", "dolphin"
-            ])
-        )
+        model_name = decision.canonical_model
 
-        completion_kwargs = {
-            "model": model_name,
-            "messages": self.messages,
-            "timeout": 120,
-        }
-        
-        # Only add tools if model is known to support them
-        if not disable_tools_for_model:
-            completion_kwargs["tools"] = self._tool_schemas
-            completion_kwargs["tool_choice"] = "auto"
-        
-        if model_name.startswith("ollama/"):
-            api_base = os.environ.get("OLLAMA_API_BASE")
-            model_lower = model_name.lower()
-            api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
-            
-            # Check if this is a cloud model
-            has_cloud_in_name = any(k in model_lower for k in ["cloud", ":cloud", "-cloud"])
-            
-            # Determine if we should use cloud
-            # Cloud if: model name contains "cloud" OR api_base is already set to cloud
-            use_cloud = has_cloud_in_name or (api_base and "ollama.com" in api_base)
-            
-            # If we're using cloud but API base is not set or is localhost, update it
-            if use_cloud and (not api_base or api_base == "http://localhost:11434"):
-                api_base = "https://ollama.com"
-                os.environ["OLLAMA_API_BASE"] = api_base
-            # If not cloud and no API base set, use localhost
-            elif not api_base:
-                api_base = "http://localhost:11434"
-                os.environ["OLLAMA_API_BASE"] = api_base
-            
-            completion_kwargs["api_base"] = api_base
-            
-            # Only add API key if we're actually using cloud
-            if use_cloud and api_key:
-                completion_kwargs["api_key"] = api_key
-            
-            # Validate Ollama cloud setup
-            if use_cloud and not api_key:
-                return f"🚨 **Ollama Cloud Error:** Model `{model_name}` requires cloud API key.\n\nUse `/api_key 10` to set `OLLAMA_API_KEY` first."
+        # Capability policy decides whether to attach tool schemas (Req 2.1, 2.2).
+        tools_enabled = tool_policy.supports_tools(decision)
 
-        # Agentic loop (mirrors while(true) in query.ts)
-        MAX_ITERATIONS = 40
+        # Local Ollama connectivity: probe + single ``ollama serve`` retry (Req 1.6).
+        if decision.is_ollama and not decision.is_cloud_ollama:
+            conn_error = model_router.ensure_local_ollama(decision.api_base)
+            if conn_error:
+                return f"🚨 **Ollama Connectivity Error:** {conn_error}"
+
+        completion_fn = model_router.get_completion_fn()
+        valid_tools = set(self._tool_instances.keys())
+
         iteration = 0
         last_tool_signatures: set = set()
+        tools_currently_enabled = tools_enabled
+        retried_without_tools = False
+
         while iteration < MAX_ITERATIONS:
             iteration += 1
+
+            # Interrupt before issuing the model request (Req 7.11, 7.12).
+            if self._aborted(abort_event):
+                return self._interrupt_return()
+
             start_time = time.time()
+
+            # --- Model call with retry-once-without-tools (Req 2.4) ---
             try:
                 try:
-                    response = litellm.completion(**completion_kwargs)
-                except (litellm.exceptions.BadRequestError, Exception) as e:
-                    # Fallback: try without tools (some models or API wrappers reject tool schemas or return 400 with them)
-                    has_tools_in_kwargs = "tools" in completion_kwargs
-                    is_tool_or_400 = (
-                        isinstance(e, litellm.exceptions.BadRequestError) or 
-                        any(k in str(e).lower() for k in ["400", "bad request", "tool", "ollamaexception"])
-                    )
-                    
-                    # Only fallback if we originally had tools and got an error
-                    if has_tools_in_kwargs and is_tool_or_400:
-                        fallback_kwargs = dict(completion_kwargs)
-                        fallback_kwargs.pop("tools", None)
-                        fallback_kwargs.pop("tool_choice", None)
-                        try:
-                            response = litellm.completion(**fallback_kwargs)
-                        except Exception:
-                            raise e
-                        text = response.choices[0].message.content or ""
-                        # Clean the text before returning
-                        text = _clean_final_text(text)
-                        if not text.strip():
-                            return (
-                                f"🚨 **Empty Response from `{model_name}`:** The model returned no content.\n\n"
-                                f"*Possible causes:* Model may not support this prompt format, or the cloud API timed out.\n"
-                                f"*Try:* Use `/model` to switch to a cloud provider like `groq/llama-3.3-70b-versatile` or `gemini/gemini-2.5-pro`."
-                            )
-                        return (
-                            f"⚠️ **Note:** `{model_name}` doesn't support tool use. Response generated without tool assistance.\n\n"
-                            + text
-                        )
+                    response = completion_fn(**self._build_kwargs(decision, tools_currently_enabled))
+                except Exception as exc:
+                    if (
+                        tools_currently_enabled
+                        and not retried_without_tools
+                        and self._is_tool_rejection(exc)
+                    ):
+                        tools_currently_enabled = False
+                        retried_without_tools = True
+                        response = completion_fn(**self._build_kwargs(decision, False))
                     else:
-                        raise e
+                        raise
+            except Exception as exc:
+                return self._classify_error(exc, model_name)
 
-            except Exception as e:
-                error_msg = getattr(e, "message", str(e)) or repr(e)
-                if any(k in error_msg for k in ["10061", "Connection refused", "actively refused", "Failed to connect"]):
-                    return f"🚨 **Ollama / Local Server Offline (`{model_name}`):** Could not connect to local API server.\n\n*Fix:* If using Ollama, open a new terminal and run `ollama serve`. Or type `/model` in this CLI to switch to a cloud provider (e.g., `groq/llama-3.3-70b-versatile`, `gemini/gemini-2.5-pro`, or `openai/gpt-4o`)."
-                if "403" in error_msg or "Permission" in error_msg:
-                    return f"🚨 **API Permission Error:** `{model_name}` access denied.\n\n*Raw Error:* {error_msg}"
-                if any(k in error_msg.lower() for k in ["auth", "key", "401", "invalid_api_key"]):
-                    return f"🚨 **API Key Missing/Invalid for `{model_name}`.**\nUse `/api_key` to set it.\n\n*Raw Error:* {error_msg}"
-                # Generic error with suggestion to try without tools
-                if "tool" in error_msg.lower() or "function" in error_msg.lower():
-                    return f"🚨 **Tool Schema Error:** Model `{model_name}` encountered an issue with tool definitions.\n\nThis model may not support function calling. Try using a different model with `/model` command.\n\n*Raw Error:* {error_msg}"
-                return f"🚨 **LLM Error:** {error_msg}\n\n*Hint:* Use `/model` to switch providers."
-
-            # Track cost
+            # --- Cost tracking (preserved) ---
             duration_ms = round((time.time() - start_time) * 1000)
-            if hasattr(response, "usage") and response.usage:
-                u = response.usage
+            usage = getattr(response, "usage", None)
+            if usage:
                 add_to_total_cost(
                     model_name,
-                    getattr(u, "prompt_tokens", 0),
-                    getattr(u, "completion_tokens", 0),
+                    getattr(usage, "prompt_tokens", 0),
+                    getattr(usage, "completion_tokens", 0),
                     duration_ms,
                 )
 
             response_message = response.choices[0].message
+            content = response_message.content or ""
             tool_calls = response_message.tool_calls
+            used_text_parser = False
 
-            # Fallback parser for open-source/cloud models that output tool calls as text inside content
-            if not tool_calls and response_message.content:
-                content_str = response_message.content.strip()
-                # Only trigger fallback on EXPLICIT markers — not random text containing "name:"
-                # This prevents the parser from firing on normal explanation text
-                has_explicit_marker = (
-                    "Tool Calls:" in content_str
-                    or "tool_call" in content_str
-                    or '```json' in content_str
-                    or '```tool' in content_str
-                    or ('"name"' in content_str and '"arguments"' in content_str)
-                )
-                if has_explicit_marker:
-                    from types import SimpleNamespace
-                    import re, uuid
-                    valid_tools = set(self._tool_instances.keys())
-                    
-                    def repair_json_string(s: str) -> str:
-                        def escape_match(match):
-                            text = match.group(0)
-                            if re.match(r'^\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})', text):
-                                return text
-                            return '\\\\' + text[1:]
-                        s_repaired = re.sub(r'\\.', escape_match, s)
-                        s_repaired = re.sub(r'\\$', r'\\\\', s_repaired)
-                        return s_repaired
+            # --- Text tool-call fallback (Req 3.5) ---
+            # Only when there are no native tool calls but the content carries
+            # explicit tool-call structures.
+            if not tool_calls and content:
+                parsed = tool_parser.extract_tool_calls(content, valid_tools)
+                if parsed:
+                    # Repeated identical text tool-calls -> stop, return final (Req 6.5).
+                    signature = tuple(
+                        sorted((c.function.name, c.function.arguments) for c in parsed)
+                    )
+                    if signature in last_tool_signatures:
+                        final_text = tool_parser.strip_tool_call_text(content)
+                        self.messages.append({"role": "assistant", "content": content})
+                        return final_text or self._empty_response_notice(model_name)
+                    last_tool_signatures.add(signature)
+                    tool_calls = parsed
+                    used_text_parser = True
 
-                    extracted = []
-                    blocks = []
-                    if "Tool Calls:" in content_str:
-                        parts = content_str.split("Tool Calls:", 1)[1].strip()
-                        idx = parts.find("[")
-                        if idx != -1:
-                            blocks.append(parts[idx:])
-                    for match in re.finditer(r'```(?:json)?\s*([\[\{].*?[\]\}])\s*```', content_str, re.DOTALL):
-                        blocks.append(match.group(1))
+            # --- No tool calls: Final_Response (Req 2.7) ---
+            if not tool_calls:
+                self.messages.append({"role": "assistant", "content": content})
+                final_text = tool_parser.strip_tool_call_text(content)
+                if not final_text.strip():
+                    return self._empty_response_notice(model_name)
+                return final_text
 
-                    # Scan for all balanced {...} or [...] JSON blocks separated by <tool_call>, newlines, or whitespace
-                    parts = re.split(r'<\|?/?tool_call\|?>|><tool_call>|```(?:json|tool)?|```', content_str)
-                    for part in parts:
-                        part = part.strip()
-                        if not part:
-                            continue
-                        i = 0
-                        while i < len(part):
-                            if part[i] in '{[':
-                                start = i
-                                stack = [part[i]]
-                                in_str = False
-                                esc = False
-                                i += 1
-                                while i < len(part) and stack:
-                                    c = part[i]
-                                    if esc:
-                                        esc = False
-                                    elif c == '\\':
-                                        esc = True
-                                    elif c == '"':
-                                        in_str = not in_str
-                                    elif not in_str:
-                                        if c == '{' or c == '[':
-                                            stack.append(c)
-                                        elif c == '}':
-                                            if stack and stack[-1] == '{':
-                                                stack.pop()
-                                        elif c == ']':
-                                            if stack and stack[-1] == '[':
-                                                stack.pop()
-                                    i += 1
-                                if not stack:
-                                    blocks.append(part[start:i])
-                            else:
-                                i += 1
+            # --- We have tool calls: record the assistant message ---
+            assistant_msg = {
+                "role": "assistant",
+                "content": content if content else None,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            }
+            self.messages.append(assistant_msg)
 
-                    for b in blocks:
-                        try:
-                            repaired_b = repair_json_string(b)
-                            data = json.loads(repaired_b, strict=False)
-                            items = data if isinstance(data, list) else [data]
-                            for item in items:
-                                if isinstance(item, dict):
-                                    fn = item.get("function", item)
-                                    name = fn.get("name")
-                                    args = fn.get("arguments", {})
-                                    if name in valid_tools:
-                                        if isinstance(args, dict):
-                                            args = json.dumps(args)
-                                        call_id = item.get("id", f"call_{uuid.uuid4().hex[:8]}")
-                                        extracted.append(SimpleNamespace(
-                                            id=call_id,
-                                            function=SimpleNamespace(name=name, arguments=args)
-                                        ))
-                        except Exception:
-                            continue
-                    if extracted:
-                        # Deduplication: skip if we already ran the exact same tool calls last iteration
-                        sig = tuple(sorted((tc.function.name, tc.function.arguments) for tc in extracted))
-                        if sig in last_tool_signatures:
-                            # Model is looping — treat as final response
-                            final_text = content_str
-                            self.messages.append({"role": "assistant", "content": final_text})
-                            return _clean_final_text(final_text)
-                        last_tool_signatures.add(sig)
-                        tool_calls = extracted
+            # --- Progress announcements (preserved) ---
+            if progress_callback:
+                if content.strip():
+                    announce = tool_parser.strip_tool_call_text(content)
+                    if announce.strip():
+                        progress_callback("assistant_message", {"content": announce})
+                for tc in tool_calls:
+                    progress_callback(tc.function.name, self._parse_args(tc))
 
-            # Handle tool calls
-            if tool_calls:
-                # Store assistant's tool call message
-                if response_message.tool_calls:
-                    self.messages.append(response_message.model_dump())
-                else:
-                    tc_dicts = [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {"name": tc.function.name, "arguments": tc.function.arguments}
-                        }
-                        for tc in tool_calls
-                    ]
-                    self.messages.append({"role": "assistant", "content": None, "tool_calls": tc_dicts})
-
-                # Run read-only tools concurrently, others serially
-                # Always announce tool calls via progress_callback (even concurrent ones)
-                if progress_callback:
-                    if response_message.content and response_message.content.strip():
-                        msg_content = response_message.content.strip()
-                        if "Tool Calls:" in msg_content:
-                            msg_content = msg_content.split("Tool Calls:")[0].strip()
-                        if "```tool" in msg_content:
-                            msg_content = msg_content.split("```tool")[0].strip()
-                        import re
-                        msg_content = re.sub(r'```(?:json|tool)?\s*[\[\{].*?[\]\}]\s*```', '', msg_content, flags=re.DOTALL).strip()
-                        msg_content = _clean_final_text(msg_content)
-                        if msg_content and not msg_content.startswith('{"name":') and not msg_content.startswith('[{"id":') and not msg_content.startswith('[{"name":'):
-                            progress_callback("assistant_message", {"content": msg_content})
-                    for tc in tool_calls:
-                        try:
-                            args = json.loads(tc.function.arguments)
-                        except Exception:
-                            args = {}
-                        progress_callback(tc.function.name, args)
-                if self._all_read_only(tool_calls):
-                    results = await self._execute_tools_concurrently(tool_calls)
-                else:
-                    results = await self._execute_tools_serially(tool_calls, progress_callback)
-
-                # Add all tool results to message history
-                for tc, result in results:
+            # Interrupt before executing the tool round (Req 7.11). The assistant
+            # tool-call message is already recorded; append a benign tool result
+            # for each pending call so history stays consistent (Req 7.12).
+            if self._aborted(abort_event):
+                for tc in tool_calls:
                     self.messages.append({
                         "role": "tool",
                         "name": tc.function.name,
                         "tool_call_id": tc.id,
-                        "content": str(result),
+                        "content": "Interrupted: tool execution was cancelled by the user.",
                     })
+                return self._interrupt_return()
 
+            # --- Execute: concurrent for all-read-only, else serial (Req 7.5, 7.6) ---
+            if self._all_read_only(tool_calls):
+                results = await self._execute_tools_concurrently(tool_calls)
             else:
-                # No tool calls — we have a final response
-                final_text = response_message.content or ""
-                self.messages.append({"role": "assistant", "content": final_text})
-                return _clean_final_text(final_text)
+                results = await self._execute_tools_serially(tool_calls)
 
-        # Exceeded max iterations — return whatever we have
-        last_msg = self.messages[-1].get("content") or ""
-        return _clean_final_text(last_msg) or "⚠️ Agent reached maximum iterations. Task may be incomplete."
+            # --- Ordered tool results, truncated, appended in call order (Req 7.7, 7.13) ---
+            for index, tc, result_content, _is_error in sorted(results, key=lambda r: r[0]):
+                self.messages.append({
+                    "role": "tool",
+                    "name": tc.function.name,
+                    "tool_call_id": tc.id,
+                    "content": self._truncate_result(result_content),
+                })
+
+        # Reached MAX_ITERATIONS with pending tool calls -> incompleteness (Req 2.8).
+        return (
+            f"⚠️ **Task may be incomplete.** The agent reached the maximum of {MAX_ITERATIONS} "
+            "iterations without producing a final answer. Try narrowing the request, or continue "
+            "with a follow-up instruction."
+        )
+
+    @staticmethod
+    def _empty_response_notice(model_name: str) -> str:
+        """Descriptive notice + recovery suggestion for an empty Final_Response (Req 6.4)."""
+        return (
+            f"🚨 **Empty response from `{model_name}`.** The model returned no usable content.\n\n"
+            "*Try:* Rephrase your request, or use `/model` to switch to a cloud provider such as "
+            "`groq/llama-3.3-70b-versatile` or `gemini/gemini-2.5-pro`."
+        )
