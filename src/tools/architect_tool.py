@@ -84,7 +84,13 @@ class ArchitectTool(BaseTool):
             )
             plan = response.choices[0].message.content or "(No plan generated)"
 
-            # Store plan to Cognee memory
+            # Store plan to Cognee memory. Pin durable storage roots FIRST so
+            # writes land in the project .cognee_data store (never site-packages).
+            try:
+                from src import cognee_paths
+                cognee_paths.configure_cognee_storage()
+            except Exception:
+                pass
             try:
                 import cognee
                 await cognee.add(
