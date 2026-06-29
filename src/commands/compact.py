@@ -50,7 +50,13 @@ async def compact_command(messages: List[Dict[str, Any]], model: str) -> tuple[s
         if not summary:
             return "Failed to generate summary. Session not compacted.", messages
 
-        # Store summary to Cognee memory so it persists permanently
+        # Store summary to Cognee memory so it persists permanently. Pin durable
+        # storage roots FIRST so writes land in the project .cognee_data store.
+        try:
+            from src import cognee_paths
+            cognee_paths.configure_cognee_storage()
+        except Exception:
+            pass
         try:
             import cognee
             await cognee.add(
