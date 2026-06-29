@@ -57,6 +57,19 @@ class AskUserTool(BaseTool):
             console.print(Panel(f"[bold white]{question}[/bold white]", title="[bold yellow]❓ Agent Clarification Needed[/bold yellow]", border_style="yellow"))
             return Prompt.ask(" [bold yellow]Your Answer[/bold yellow]").strip()
 
-        # Run prompt synchronously in executor thread to keep async loop responsive
-        user_reply = await asyncio.get_event_loop().run_in_executor(None, _ask)
+        # Pause the REPL's live spinner while we read input so it doesn't fight
+        # the prompt for the terminal, then restore it.
+        try:
+            from src.cli import ui_state
+        except Exception:
+            ui_state = None
+
+        paused = ui_state.pause_status() if ui_state else None
+        try:
+            # Run the blocking prompt in an executor thread to keep the async
+            # loop responsive while waiting for the user's answer.
+            user_reply = await asyncio.get_event_loop().run_in_executor(None, _ask)
+        finally:
+            if ui_state:
+                ui_state.resume_status(paused)
         return f"User replied: '{user_reply}'"
