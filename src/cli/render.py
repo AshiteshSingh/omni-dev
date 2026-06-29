@@ -467,7 +467,7 @@ def _iter_chunks_sync(stream):
         yield chunk
 
 
-async def stream_response(stream, console, theme=None):
+async def stream_response(stream, console, theme=None, on_first_chunk=None):
     """Render a streaming model response and return ``(final_text, tool_calls)``.
 
     Consumes a ``litellm`` streaming response — an iterable (sync or async) of
@@ -523,10 +523,6 @@ async def stream_response(stream, console, theme=None):
         # Not a stream at all — nothing to render (Req 3.8).
         return "", []
 
-    # Live streaming only makes sense on a real terminal. For non-terminal
-    # consoles (tests, pipes, capture) we skip Live and do a single committed
-    # render at the end, which is byte-identical to render_final — guaranteeing
-    # the streamed result equals the non-streamed result (Property 9).
     use_live = (
         Live is not None
         and console is not None
@@ -534,11 +530,14 @@ async def stream_response(stream, console, theme=None):
     )
 
     live = None
-    try:
-        if use_live:
+    first_fired = False
+
+    def _start_live_if_needed():
+        nonlocal live
+        if use_live and live is None:
             try:
                 live = Live(
-                    _stream_renderable(""),
+                    _stream_renderable("".join(content_parts)),
                     console=console,
                     refresh_per_second=30,
                     transient=True,
@@ -547,28 +546,42 @@ async def stream_response(stream, console, theme=None):
             except Exception:
                 live = None
 
+    def _on_change():
+        # Fire the first-chunk hook once (used to stop the caller's spinner and
+        # print the assistant header), then lazily start the Live view so the
+        # spinner can keep animating until the first token actually arrives.
+        nonlocal first_fired
+        if not first_fired:
+            first_fired = True
+            if on_first_chunk is not None:
+                try:
+                    on_first_chunk()
+                except Exception:
+                    pass
+            _start_live_if_needed()
+        if live is not None:
+            try:
+                live.update(_stream_renderable("".join(content_parts)))
+            except Exception:
+                pass
+
+    try:
         if is_async:
             async for chunk in stream:  # type: ignore[union-attr]
                 try:
                     changed = _consume_chunk(chunk)
                 except Exception:
                     changed = False
-                if changed and live is not None:
-                    try:
-                        live.update(_stream_renderable("".join(content_parts)))
-                    except Exception:
-                        pass
+                if changed:
+                    _on_change()
         else:
             for chunk in _iter_chunks_sync(stream):
                 try:
                     changed = _consume_chunk(chunk)
                 except Exception:
                     changed = False
-                if changed and live is not None:
-                    try:
-                        live.update(_stream_renderable("".join(content_parts)))
-                    except Exception:
-                        pass
+                if changed:
+                    _on_change()
     except Exception:
         # Any unexpected failure during iteration: stop streaming but still
         # return what was accumulated so the caller can recover (Req 3.8).
@@ -595,7 +608,9 @@ async def stream_response(stream, console, theme=None):
     except Exception:
         tool_calls = []
 
-    return clean_for_display(raw_buffer), tool_calls
+    # Return the RAW buffer (not cleaned): the caller's loop may need the raw
+    # text to detect text-encoded tool calls. Display above is already cleaned.
+    return raw_buffer, tool_calls
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -723,6 +738,114 @@ def _diff_body_text(hunks: list):
     return body
 
 
+class NumberedDiffLine(NamedTuple):
+    """A diff line carrying its line number for rendering (kind, text, lineno)."""
+
+    kind: str
+    text: str
+    lineno: int | None
+
+
+def compute_numbered_hunks(old: str, new: str, context: int = 3) -> list:
+    """Like :func:`compute_diff_hunks` but each line carries a line number.
+
+    Added/context lines are numbered by their position in the NEW file; removed
+    lines are numbered by their position in the OLD file. Mirrors Claude Code's
+    ``StructuredDiff`` line numbering. Pure and total: never raises.
+    """
+    old_text = old or ""
+    new_text = new or ""
+    new_lines = new_text.splitlines()
+    old_lines = old_text.splitlines()
+
+    if not old_text:
+        if not new_lines:
+            return []
+        return [[NumberedDiffLine("added", ln, i + 1) for i, ln in enumerate(new_lines)]]
+
+    try:
+        ctx = context if isinstance(context, int) and context >= 0 else 3
+        matcher = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+        hunks: list = []
+        for group in matcher.get_grouped_opcodes(ctx):
+            hunk: list = []
+            for tag, i1, i2, j1, j2 in group:
+                if tag == "equal":
+                    for off, line in enumerate(old_lines[i1:i2]):
+                        hunk.append(NumberedDiffLine("context", line, j1 + off + 1))
+                elif tag == "replace":
+                    for off, line in enumerate(old_lines[i1:i2]):
+                        hunk.append(NumberedDiffLine("removed", line, i1 + off + 1))
+                    for off, line in enumerate(new_lines[j1:j2]):
+                        hunk.append(NumberedDiffLine("added", line, j1 + off + 1))
+                elif tag == "delete":
+                    for off, line in enumerate(old_lines[i1:i2]):
+                        hunk.append(NumberedDiffLine("removed", line, i1 + off + 1))
+                elif tag == "insert":
+                    for off, line in enumerate(new_lines[j1:j2]):
+                        hunk.append(NumberedDiffLine("added", line, j1 + off + 1))
+            if hunk:
+                hunks.append(hunk)
+        return hunks
+    except Exception:
+        return []
+
+
+# Background line styles + gutter for the numbered renderer.
+_DIFF_BG_STYLE = {
+    "added": "diff.add.bg",
+    "removed": "diff.del.bg",
+    "context": "diff.ctx",
+}
+
+
+def _diff_body_numbered(hunks: list):
+    """Build a Rich ``Text`` body with line numbers + background highlighting.
+
+    Each row: right-aligned line number (``diff.lineno``), a ``+``/``-``/`` ``
+    gutter, then the escape-normalized code styled with a background for
+    added/removed lines (mirrors Claude Code's StructuredDiff). Returns ``None``
+    if Rich ``Text`` is unavailable.
+    """
+    if Text is None:
+        return None
+    if not hunks:
+        body = Text()
+        body.append("(no changes)", style="diff.ctx")
+        return body
+
+    # Width of the largest line number across all hunks, for alignment.
+    max_no = 1
+    for hunk in hunks:
+        for ln in hunk:
+            n = getattr(ln, "lineno", None)
+            if isinstance(n, int) and n > max_no:
+                max_no = n
+    width = len(str(max_no))
+
+    body = Text()
+    for h_idx, hunk in enumerate(hunks):
+        if h_idx > 0:
+            body.append(("\u22ef" + "\n"), style="diff.ctx")  # ⋯ hunk divider
+        for line in hunk:
+            kind = getattr(line, "kind", "context")
+            raw = getattr(line, "text", "")
+            no = getattr(line, "lineno", None)
+            gutter = _DIFF_PREFIX.get(kind, " ")
+            bg_style = _DIFF_BG_STYLE.get(kind, "diff.ctx")
+            try:
+                cleaned = normalize_escapes(raw)
+            except Exception:
+                cleaned = raw if isinstance(raw, str) else str(raw)
+            for sub in cleaned.split("\n"):
+                num_label = (str(no).rjust(width) if isinstance(no, int) else " " * width)
+                body.append(f"{num_label} ", style="diff.lineno")
+                body.append(f"{gutter} ", style=bg_style)
+                body.append(sub, style=bg_style)
+                body.append("\n")
+    return body
+
+
 def _print_unified_diff(old: str, new: str, path: str, console) -> None:
     """Last-resort plain unified-diff print used when Rich is unavailable."""
     try:
@@ -759,7 +882,7 @@ def render_diff(old: str, new: str, path: str, console, theme=None) -> None:
     rendering fails, it falls back to printing a plain unified diff.
     """
     try:
-        hunks = compute_diff_hunks(old or "", new or "")
+        hunks = compute_numbered_hunks(old or "", new or "")
     except Exception:
         hunks = []
 
@@ -767,7 +890,7 @@ def render_diff(old: str, new: str, path: str, console, theme=None) -> None:
 
     if Panel is not None and Text is not None and console is not None:
         try:
-            body = _diff_body_text(hunks)
+            body = _diff_body_numbered(hunks)
             if body is not None:
                 panel = Panel(
                     body,

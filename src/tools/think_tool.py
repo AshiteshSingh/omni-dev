@@ -46,7 +46,14 @@ class ThinkTool(BaseTool):
 
     async def call(self, thought: str) -> str:
         """Log the thought to memory and return confirmation."""
-        # We store to Cognee memory - this preserves the memory integration
+        # We store to Cognee memory - this preserves the memory integration.
+        # Pin durable storage roots FIRST so writes land in the project
+        # .cognee_data store (never site-packages).
+        try:
+            from src import cognee_paths
+            cognee_paths.configure_cognee_storage()
+        except Exception:
+            pass
         try:
             import cognee
             await cognee.add(f"Agent Thought Process: {thought}", dataset_name="agent_thoughts")

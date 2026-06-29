@@ -150,6 +150,49 @@ def get_agents_md() -> Optional[str]:
     return None
 
 
+def get_nested_instructions(max_depth: int = 4, max_files: int = 20) -> Optional[str]:
+    """Discover AGENTS.md / CLAUDE.md files in subdirectories.
+
+    Mirrors getClaudeFiles() in scratch_repo: the agent is told that additional
+    instruction files exist deeper in the tree so it reads and follows them when
+    working in those directories. Returns ``None`` when none are found beyond the
+    project root (the root file is already injected by :func:`get_agents_md`).
+    Bounded by depth/count and never raises.
+    """
+    cwd = os.getcwd()
+    skip = {".git", "node_modules", "venv", ".venv", "__pycache__", "dist",
+            "build", ".next", ".cognee_data", "scratch_repo"}
+    found: list[str] = []
+    try:
+        base_depth = cwd.rstrip(os.sep).count(os.sep)
+        for root, dirs, files in os.walk(cwd):
+            dirs[:] = [d for d in dirs if d not in skip and not d.startswith(".")]
+            depth = root.rstrip(os.sep).count(os.sep) - base_depth
+            if depth > max_depth:
+                dirs[:] = []
+                continue
+            # Skip the root itself (handled by get_agents_md).
+            if os.path.normpath(root) == os.path.normpath(cwd):
+                continue
+            for fname in ("AGENTS.md", "CLAUDE.md"):
+                if fname in files:
+                    rel = os.path.relpath(os.path.join(root, fname), cwd)
+                    found.append(rel)
+            if len(found) >= max_files:
+                break
+    except Exception:
+        return None
+
+    if not found:
+        return None
+    listing = "\n".join(f"- {p}" for p in found[:max_files])
+    return (
+        "NOTE: Additional AGENTS.md/CLAUDE.md files were found in subdirectories. "
+        "When working in those directories, read and follow the instructions in the "
+        f"corresponding file:\n{listing}"
+    )
+
+
 async def get_context() -> Dict[str, str]:
     """
     Get full context dict to inject into system prompt.
@@ -171,9 +214,10 @@ async def get_context() -> Dict[str, str]:
     dir_struct_task = asyncio.get_event_loop().run_in_executor(None, get_directory_structure)
     readme_task = asyncio.get_event_loop().run_in_executor(None, get_readme)
     agents_md_task = asyncio.get_event_loop().run_in_executor(None, get_agents_md)
+    nested_task = asyncio.get_event_loop().run_in_executor(None, get_nested_instructions)
 
-    git_status, dir_struct, readme, agents_md = await asyncio.gather(
-        git_status_task, dir_struct_task, readme_task, agents_md_task,
+    git_status, dir_struct, readme, agents_md, nested = await asyncio.gather(
+        git_status_task, dir_struct_task, readme_task, agents_md_task, nested_task,
         return_exceptions=True,
     )
 
@@ -185,6 +229,8 @@ async def get_context() -> Dict[str, str]:
         ctx["readme"] = readme
     if agents_md and not isinstance(agents_md, Exception):
         ctx["agentInstructions"] = agents_md
+    if nested and not isinstance(nested, Exception):
+        ctx["nestedInstructions"] = nested
 
     _CONTEXT_CACHE = ctx
     _CONTEXT_CACHE_CWD = cwd

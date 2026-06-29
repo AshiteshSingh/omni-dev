@@ -23,6 +23,14 @@ if project_root not in sys.path:
 
 from src.agent.core import OmniDevAgent
 
+# Pin Cognee's durable storage roots into the project .cognee_data store before
+# ANY cognee operation. Side-effecting import (self-configures on import), so the
+# headless sub-agent process writes to the same graph as the main CLI.
+try:
+    from src import cognee_paths  # noqa: F401
+except Exception:
+    pass
+
 # Load environment variables
 load_dotenv()
 
@@ -51,6 +59,11 @@ async def run_subagent(task_description: str, subagent_id: str):
 
     except Exception as e:
         # If sub-agent fails, log the failure to Cognee memory
+        try:
+            from src import cognee_paths
+            cognee_paths.configure_cognee_storage()
+        except Exception:
+            pass
         try:
             import cognee
             await cognee.add(

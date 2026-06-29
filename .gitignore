@@ -6,3 +6,5 @@ dist/
 build/
 .cognee_data/
 *.cognee_db
+.pytest_cache/
+*.pyc

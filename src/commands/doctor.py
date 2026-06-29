@@ -172,23 +172,47 @@ async def doctor_command() -> str:
     # --- Cognee Memory Health ---
     lines.append("\n### 🧠 Cognee Memory Health")
     try:
-        import cognee as cg
-        import os as _os
-        cg_file = cg.__file__
-        db_path = _os.path.join(_os.path.dirname(cg_file), '.cognee_system', 'databases')
-        if _os.path.exists(db_path):
-            db_file = _os.path.join(db_path, 'cognee_db')
-            if _os.path.exists(db_file):
-                size_kb = _os.path.getsize(db_file) // 1024
+        import cognee as cg  # noqa: F401
+        # Read the ACTUAL configured store location (pinned to project .cognee_data
+        # by src/cognee_paths.py), not the volatile site-packages default.
+        try:
+            from src import cognee_paths
+            cognee_paths.configure_cognee_storage()
+            db_path = os.path.join(cognee_paths.COGNEE_SYSTEM_DIR, "databases")
+        except Exception:
+            import os as _os
+            db_path = _os.path.join(_os.path.dirname(cg.__file__), ".cognee_system", "databases")
+
+        if os.path.exists(db_path):
+            db_file = os.path.join(db_path, "cognee_db")
+            if os.path.exists(db_file):
+                size_kb = os.path.getsize(db_file) // 1024
                 lines.append(f"  ✅ Cognee DB found: {db_file}")
                 lines.append(f"  📦 DB size: {size_kb} KB {'(has stored memories)' if size_kb > 10 else '(empty — no memories yet)'}")
             else:
-                lines.append(f"  ⚠️  Cognee DB directory exists but no database file yet")
-                lines.append(f"  💡 Talk to Omni-Dev and memories will be stored automatically")
+                lines.append("  ⚠️  Cognee DB directory exists but no database file yet")
+                lines.append("  💡 Talk to Omni-Dev and memories will be stored automatically")
         else:
             lines.append("  ⚠️  Cognee DB directory not found — memories not yet initialized")
         lines.append(f"  📁 DB location: {db_path}")
-        lines.append("  ℹ️  API version: Cognee 1.2.2 (recall/remember API)")
+
+        # LLM/embedding wiring — the graph layer is dead without these.
+        try:
+            from cognee.infrastructure.llm.config import get_llm_config
+            from cognee.infrastructure.databases.vector.embeddings.config import get_embedding_config
+            lc = get_llm_config()
+            ec = get_embedding_config()
+            llm_ok = bool(getattr(lc, "llm_api_key", None))
+            emb_ok = bool(getattr(ec, "embedding_api_key", None)) or bool(getattr(ec, "embedding_endpoint", None))
+            lines.append(f"  {'✅' if llm_ok else '❌'} LLM provider: {lc.llm_provider}/{lc.llm_model} (api key {'set' if llm_ok else 'MISSING'})")
+            lines.append(f"  {'✅' if emb_ok else '❌'} Embeddings: {ec.embedding_provider}/{ec.embedding_model} (api key {'set' if emb_ok else 'MISSING'})")
+            if not (llm_ok and emb_ok):
+                lines.append("  💡 Graph memory needs LLM + embedding credentials. Set LLM_PROVIDER/LLM_API_KEY")
+                lines.append("     and EMBEDDING_PROVIDER/EMBEDDING_API_KEY in .env, then run: python verify_memory.py")
+        except Exception:
+            pass
+
+        lines.append("  ℹ️  API version: Cognee 1.2.2 — full lifecycle: remember / recall / improve / forget (+ add/cognify/search)")
     except Exception as e:
         lines.append(f"  ❌ Cognee memory check failed: {e}")
 

@@ -60,7 +60,16 @@ SYSTEM_INSTRUCTION = (
     "1. After completing any significant task (building a website, writing code, finishing a feature), "
     "   ALWAYS call 'remember' to store a concise summary: what was built, where the files are, what the user wanted.\n"
     "2. When the user says 'I told you before' or 'you forgot', immediately call 'recall' to retrieve it.\n"
-    "3. ALWAYS use 'remember' after: creating files, building projects, learning user preferences, completing research.\n\n"
+    "3. ALWAYS use 'remember' after: creating files, building projects, learning user preferences, completing research.\n"
+    "3b. After a burst of related 'remember' calls or at the end of a work session, call 'improve_memory' to "
+    "   consolidate the Cognee graph (global context index + truth subspace) so future recall is sharper.\n"
+    "4. CODEBASE / REPO MEMORY: When the user asks about a FILE, FOLDER, REPOSITORY, function, or CODE "
+    "   (e.g. 'tell me about 36qubits.py', 'what does repo X do', 'explain the grover simulation'), you MUST "
+    "   call 'recall' to search the Cognee graph memory with the file/topic name BEFORE touching the filesystem. "
+    "   If the file is NOT found on disk, DO NOT give up and DO NOT ask the user where it is — it was very likely "
+    "   cloned, indexed (via /index), and later deleted. The knowledge lives in graph memory, not on disk. "
+    "   Call 'recall' (e.g. recall('36qubits.py grover simulation code')) and answer from what it returns. "
+    "   Only fall back to filesystem tools (list_dir/find/grep) if recall returns nothing useful.\n\n"
     "ENVIRONMENT: Windows 11 — PowerShell shell. NEVER use Unix shell syntax:\n"
     "  ❌ WRONG (Linux/Mac): python server.py &   sleep 2 && curl   nohup python app.py\n"
     "  ✅ CORRECT (Windows): python server.py  (with a short timeout)  or  start python server.py\n"
@@ -87,6 +96,55 @@ SYSTEM_INSTRUCTION = (
 MAX_ITERATIONS = 40
 MAX_TOOL_USE_CONCURRENCY = 10
 MAX_TOOL_RESULT_CHARS = 10_000
+
+# Prompt-time GraphRAG injection bounds (keep the injected block concise).
+MAX_GRAPH_CONTEXT_EDGES = 40
+
+
+def _graph_node_label(node) -> str:
+    """Render a concise ``type name (path)`` label for a graph node."""
+    attrs = getattr(node, "attrs", None) or {}
+    name = attrs.get("name") or attrs.get("path") or attrs.get("summary")
+    if not name:
+        name = getattr(node, "id", "?")
+    path = attrs.get("path")
+    ntype = getattr(node, "type", "node")
+    if path and name != path:
+        return f"{ntype} {name} ({path})"
+    return f"{ntype} {name}"
+
+
+def _render_subgraph_text(result) -> str:
+    """Render a retrieved subgraph as a concise text summary for prompt context.
+
+    Lists the matched/related nodes (type, name, path) and their key
+    relationships, prefixed by any staleness notice carried on the result.
+    """
+    lines: list[str] = []
+    notice = getattr(result, "notice", None)
+    if notice:
+        lines.append(str(notice))
+
+    lines.append("Relevant code entities (from the codebase knowledge graph):")
+    for node in result.nodes:
+        lines.append(f"- {_graph_node_label(node)}")
+
+    edges = getattr(result, "edges", None) or []
+    if edges:
+        nodes_by_id = {n.id: n for n in result.nodes}
+
+        def _short(node_id):
+            node = nodes_by_id.get(node_id)
+            if node is None:
+                return node_id
+            attrs = getattr(node, "attrs", None) or {}
+            return attrs.get("name") or attrs.get("path") or node_id
+
+        lines.append("Relationships:")
+        for edge in edges[:MAX_GRAPH_CONTEXT_EDGES]:
+            lines.append(f"- {_short(edge.src)} --{edge.type}--> {_short(edge.dst)}")
+
+    return "\n".join(lines)
 
 
 class OmniDevAgent:
@@ -121,6 +179,11 @@ class OmniDevAgent:
         # interface layer sets this to an interactive approve/deny/remember
         # prompt. When None, the loop falls back to the permissions module.
         self.can_use_tool = None
+        # Optional async streaming renderer injected by the interface:
+        #   async def stream_render(stream) -> (raw_text, tool_calls)
+        # When set, the loop streams the model response token-by-token through it
+        # for live rendering. When None, the loop uses a single non-streaming call.
+        self.stream_render = None
 
     # ------------------------------------------------------------------ #
     # Session helpers
@@ -421,7 +484,33 @@ class OmniDevAgent:
         until a Final_Response or the iteration bound.
         """
         # --- Context injection (preserved) ---
+        self._final_was_streamed = False
         context = await self._load_context()
+
+        # --- Best-effort prompt-time GraphRAG context injection (Req 4.6, 9.4) ---
+        # Local-only: load the knowledge graph and, if non-empty, retrieve a
+        # relevant subgraph for the prompt and inject it as a new ``codebaseGraph``
+        # context key. The ENTIRE block is wrapped so ANY failure (missing graph,
+        # import error, retrieval error) leaves the existing static-context
+        # behavior completely unchanged and never raises into the loop. Imports
+        # are lazy/local to avoid import-time coupling.
+        try:
+            from src.graph.store import GraphStore
+            from src.graph.config import get_graph_config
+            from src.graph.retrieval import GraphRAGRetriever
+
+            graph, meta = GraphStore().load()
+            if graph.nodes:
+                retriever = GraphRAGRetriever(
+                    graph, get_graph_config(), os.getcwd(), meta
+                )
+                result = retriever.retrieve(prompt)
+                if result.nodes:
+                    context = {**context, "codebaseGraph": _render_subgraph_text(result)}
+        except Exception:
+            # Graph context is strictly additive and best-effort; never block the prompt.
+            pass
+
         full_system = format_system_prompt_with_context(self.system_instruction, context)
         if self.messages and self.messages[0]["role"] == "system":
             self.messages[0]["content"] = full_system
@@ -467,27 +556,76 @@ class OmniDevAgent:
 
             start_time = time.time()
 
-            # --- Model call with retry-once-without-tools (Req 2.4) ---
-            try:
-                try:
-                    response = completion_fn(**self._build_kwargs(decision, tools_currently_enabled))
-                except Exception as exc:
-                    if (
-                        tools_currently_enabled
-                        and not retried_without_tools
-                        and self._is_tool_rejection(exc)
-                    ):
-                        tools_currently_enabled = False
-                        retried_without_tools = True
-                        response = completion_fn(**self._build_kwargs(decision, False))
-                    else:
-                        raise
-            except Exception as exc:
-                return self._classify_error(exc, model_name)
+            # --- Model call: stream when a renderer is injected, else one-shot ---
+            streamed = False
+            content = ""
+            tool_calls = None
+            usage = None
+            response = None
 
-            # --- Cost tracking (preserved) ---
+            stream_render = getattr(self, "stream_render", None)
+            if stream_render is not None:
+                try:
+                    kwargs = self._build_kwargs(decision, tools_currently_enabled)
+                    kwargs["stream"] = True
+                    try:
+                        kwargs["stream_options"] = {"include_usage": True}
+                    except Exception:
+                        pass
+                    stream = completion_fn(**kwargs)
+
+                    # Tap each chunk for usage (cost tracking) while the renderer
+                    # consumes the stream for live display.
+                    captured = {"usage": None}
+
+                    def _tap(src):
+                        for ch in src:
+                            try:
+                                u = getattr(ch, "usage", None)
+                                if u:
+                                    captured["usage"] = u
+                            except Exception:
+                                pass
+                            yield ch
+
+                    content, tool_calls = await stream_render(_tap(stream))
+                    usage = captured["usage"]
+                    streamed = True
+                except Exception:
+                    # Streaming failed to even start — fall back to non-streaming.
+                    streamed = False
+
+            # An empty stream (e.g. auth error surfaced mid-iteration) falls back
+            # so the non-streaming path can produce a real response / clear error.
+            if streamed and not (content and content.strip()) and not tool_calls:
+                streamed = False
+
+            if not streamed:
+                # --- Non-streaming call with retry-once-without-tools (Req 2.4) ---
+                try:
+                    try:
+                        response = completion_fn(**self._build_kwargs(decision, tools_currently_enabled))
+                    except Exception as exc:
+                        if (
+                            tools_currently_enabled
+                            and not retried_without_tools
+                            and self._is_tool_rejection(exc)
+                        ):
+                            tools_currently_enabled = False
+                            retried_without_tools = True
+                            response = completion_fn(**self._build_kwargs(decision, False))
+                        else:
+                            raise
+                except Exception as exc:
+                    return self._classify_error(exc, model_name)
+
+                usage = getattr(response, "usage", None)
+                response_message = response.choices[0].message
+                content = response_message.content or ""
+                tool_calls = response_message.tool_calls
+
+            # --- Cost tracking (preserved; works for both paths) ---
             duration_ms = round((time.time() - start_time) * 1000)
-            usage = getattr(response, "usage", None)
             if usage:
                 add_to_total_cost(
                     model_name,
@@ -496,9 +634,6 @@ class OmniDevAgent:
                     duration_ms,
                 )
 
-            response_message = response.choices[0].message
-            content = response_message.content or ""
-            tool_calls = response_message.tool_calls
             used_text_parser = False
 
             # --- Text tool-call fallback (Req 3.5) ---
@@ -525,6 +660,9 @@ class OmniDevAgent:
                 final_text = tool_parser.strip_tool_call_text(content)
                 if not final_text.strip():
                     return self._empty_response_notice(model_name)
+                # Tell the interface whether the final answer was already shown
+                # live by the stream renderer (so it doesn't double-render).
+                self._final_was_streamed = bool(streamed)
                 return final_text
 
             # --- We have tool calls: record the assistant message ---
@@ -547,7 +685,9 @@ class OmniDevAgent:
 
             # --- Progress announcements (preserved) ---
             if progress_callback:
-                if content.strip():
+                # When streamed, the assistant prose was already rendered live by
+                # the stream renderer — don't re-announce it.
+                if content.strip() and not streamed:
                     announce = tool_parser.strip_tool_call_text(content)
                     if announce.strip():
                         progress_callback("assistant_message", {"content": announce})
@@ -574,13 +714,26 @@ class OmniDevAgent:
                 results = await self._execute_tools_serially(tool_calls)
 
             # --- Ordered tool results, truncated, appended in call order (Req 7.7, 7.13) ---
-            for index, tc, result_content, _is_error in sorted(results, key=lambda r: r[0]):
+            for index, tc, result_content, is_error in sorted(results, key=lambda r: r[0]):
                 self.messages.append({
                     "role": "tool",
                     "name": tc.function.name,
                     "tool_call_id": tc.id,
                     "content": self._truncate_result(result_content),
                 })
+                # Surface a concise completion line for the UI (Claude-Code-style
+                # "result" feedback under each activity). Best-effort; never breaks
+                # the loop if the callback raises.
+                if progress_callback:
+                    try:
+                        progress_callback("__tool_result__", {
+                            "tool": tc.function.name,
+                            "args": self._parse_args(tc),
+                            "result": str(result_content),
+                            "is_error": bool(is_error),
+                        })
+                    except Exception:
+                        pass
 
         # Reached MAX_ITERATIONS with pending tool calls -> incompleteness (Req 2.8).
         return (

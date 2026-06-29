@@ -13,11 +13,17 @@ from .think_tool import ThinkTool
 from .notebook_tool import NotebookReadTool, NotebookEditTool
 from .architect_tool import ArchitectTool
 from .agent_tool import AgentSubTool
-from .memory_tools import MemoryReadTool, MemoryWriteTool
+from .memory_tools import (
+    MemoryReadTool,
+    MemoryWriteTool,
+    ForgetMemoryTool,
+    ImproveMemoryTool,
+)
 from .web_search_tool import WebSearchTool
 from .browser_tool import BrowserTool
 from .url_read_tool import UrlReadTool
 from .ask_user_tool import AskUserTool
+from .query_graph_tool import QueryGraphTool
 
 __all__ = [
     "BashTool",
@@ -34,10 +40,13 @@ __all__ = [
     "AgentSubTool",
     "MemoryReadTool",
     "MemoryWriteTool",
+    "ForgetMemoryTool",
+    "ImproveMemoryTool",
     "WebSearchTool",
     "BrowserTool",
     "UrlReadTool",
     "AskUserTool",
+    "QueryGraphTool",
 ]
 
 def get_all_tools():
@@ -57,10 +66,13 @@ def get_all_tools():
         AgentSubTool(),
         MemoryReadTool(),
         MemoryWriteTool(),
+        ForgetMemoryTool(),
+        ImproveMemoryTool(),
         WebSearchTool(),
         BrowserTool(),
         UrlReadTool(),
         AskUserTool(),
+        QueryGraphTool(),
     ]
 
 def get_json_schemas():

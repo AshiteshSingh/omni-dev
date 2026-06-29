@@ -52,7 +52,24 @@ OMNI_THEME = Theme(
         "diff.add": "#98C379",
         "diff.del": "#E06C75",
         "diff.ctx": "dim #8A8F98",
+        "diff.add.bg": "#d6ffd6 on #133a1f",
+        "diff.del.bg": "#ffd9d9 on #3a1417",
+        "diff.lineno": "dim #7d8590",
     }
+)
+
+
+# Whimsical "thinking" verbs (ported from Claude Code's Spinner). One is chosen
+# at random per turn so the wait indicator feels alive without rotating noisily.
+THINKING_VERBS = (
+    "Accomplishing", "Actioning", "Analyzing", "Baking", "Brewing", "Calculating",
+    "Cerebrating", "Churning", "Coalescing", "Cogitating", "Composing", "Computing",
+    "Conjuring", "Considering", "Cooking", "Crafting", "Creating", "Crunching",
+    "Deliberating", "Determining", "Distilling", "Forging", "Forming", "Generating",
+    "Hatching", "Ideating", "Inferring", "Manifesting", "Marinating", "Mulling",
+    "Musing", "Noodling", "Percolating", "Pondering", "Processing", "Reasoning",
+    "Reticulating", "Ruminating", "Simmering", "Synthesizing", "Thinking",
+    "Transmuting", "Vibing", "Working", "Wrangling",
 )
 
 
@@ -136,6 +153,7 @@ GLYPHS_UTF8: dict[str, str] = {
     # framing
     "bar": "\u2502",        # │
     "turn_end": "\u2570\u2500",  # ╰─
+    "corner": "\u2514",     # └  (tool-result continuation)
     "sep": "\u00b7",        # ·  (status-footer separator)
     "branch": "\u2387",     # ⎇  (status-footer git branch marker)
 }
@@ -151,6 +169,7 @@ GLYPHS_ASCII: dict[str, str] = {
     # framing
     "bar": "|",
     "turn_end": "`-",
+    "corner": "\\_",
     "sep": "-",
     "branch": "git:",
 }
@@ -265,7 +284,112 @@ def format_tool_activity(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Message framing
+# Tool-result lines (Claude-Code-style completion feedback)
+# ─────────────────────────────────────────────────────────────────────────────
+def _primary_target(tool_name: str, args: Mapping[str, Any]) -> str:
+    """Pull the most relevant single argument to attribute a result line."""
+    a = args or {}
+    if tool_name in ("read_file", "read_notebook", "edit_notebook"):
+        return _truncate(a.get("path", ""), 48)
+    if tool_name in ("write_file",):
+        return _truncate(a.get("path", a.get("file_path", "")), 48)
+    if tool_name in ("edit_file",):
+        return _truncate(a.get("file_path", a.get("path", "")), 48)
+    if tool_name in ("search_codebase", "glob_files"):
+        return _truncate(a.get("pattern", ""), 40)
+    if tool_name in ("search_web", "recall"):
+        return _truncate(a.get("query", ""), 40)
+    if tool_name == "read_url_content":
+        return _truncate(a.get("url", ""), 48)
+    if tool_name == "list_dir":
+        return _truncate(a.get("path", "."), 48)
+    return ""
+
+
+def summarize_tool_result(tool_name: str, result: Any, is_error: bool = False) -> str:
+    """Turn a raw tool result into a concise, human-readable one-line summary.
+
+    This is what gives the UI its "showing the real work" feel: line counts for
+    reads, match counts for searches, exit/first-line for commands, etc. Pure and
+    total — never raises.
+    """
+    try:
+        text = "" if result is None else str(result)
+    except Exception:
+        text = ""
+    stripped = text.strip()
+
+    if is_error:
+        first = next((ln for ln in stripped.splitlines() if ln.strip()), "")
+        return _truncate(first, 120) or "failed"
+
+    nonempty = [ln for ln in stripped.splitlines() if ln.strip()]
+    low = stripped.lower()
+
+    if tool_name in ("read_file", "read_notebook"):
+        n = len(stripped.splitlines()) if stripped else 0
+        return f"Read {n} line{'s' if n != 1 else ''}"
+    if tool_name in ("search_codebase", "glob_files"):
+        if not stripped or "no match" in low or "no files" in low:
+            return "No matches"
+        n = len(nonempty)
+        return f"{n} result{'s' if n != 1 else ''}"
+    if tool_name == "list_dir":
+        n = len(nonempty)
+        return f"{n} entr{'ies' if n != 1 else 'y'}"
+    if tool_name == "run_command":
+        first = next((ln for ln in nonempty), "")
+        return _truncate(first, 100) if first else "Command finished"
+    if tool_name in ("write_file", "edit_file", "edit_notebook"):
+        return "File updated"
+    if tool_name == "remember":
+        return _truncate(stripped, 90) or "Saved to memory"
+    if tool_name == "improve_memory":
+        return _truncate(stripped, 90) or "Memory consolidated"
+    if tool_name == "forget":
+        return _truncate(stripped, 90) or "Memory cleared"
+    if tool_name == "recall":
+        if not stripped or "no relevant memories" in low:
+            return "No memories found"
+        return "Memories retrieved"
+    if tool_name in ("search_web", "read_url_content"):
+        first = next((ln for ln in nonempty), "")
+        return _truncate(first, 100) if first else "Fetched"
+    if tool_name in ("think", "architect", "ask_user"):
+        return ""  # these speak for themselves; no result line
+
+    first = next((ln for ln in nonempty), "")
+    return _truncate(first, 100) if first else "Done"
+
+
+def format_tool_result(
+    tool_name: str,
+    result: Any,
+    is_error: bool = False,
+    args: Optional[Mapping[str, Any]] = None,
+    console: Optional[Console] = None,
+) -> Optional[Text]:
+    """Render the indented ``└ summary · target`` completion line for a tool.
+
+    Returns ``None`` when there is nothing meaningful to show (so the caller can
+    skip printing). Themed: success uses ``app.muted``, errors use ``status.err``.
+    """
+    summary = summarize_tool_result(tool_name, result, is_error)
+    if not summary:
+        return None
+
+    gmap = glyphs_for(console)
+    corner = gmap.get("corner", "\u2514")
+    style = "status.err" if is_error else "app.muted"
+
+    target = "" if is_error else _primary_target(tool_name, args or {})
+    line = Text("  ")
+    line.append(f"{corner} ", style=style)
+    line.append(summary, style=style)
+    if target:
+        line.append(f"  {gmap.get('sep', '·')} ", style="app.muted")
+        line.append(target, style="app.muted")
+    return line
 # ─────────────────────────────────────────────────────────────────────────────
 # User and assistant turns are framed with a left gutter bar; tool activity is
 # indented under the assistant turn without a bar (Req 4.1, 4.2).
@@ -316,34 +440,51 @@ def tool_activity_indent(activity: Text, console: Optional[Console] = None) -> T
 # ─────────────────────────────────────────────────────────────────────────────
 # Banner
 # ─────────────────────────────────────────────────────────────────────────────
-_LOGO_LINES = (
-    r" /\_/\ ",
-    r"( o.o )  omni-dev",
-    r" > ^ <  ",
-)
+# A compact block-letter font (5 rows tall) used to render "OMNI-DEV" clearly at
+# startup. Assembled column-by-column so the letters always stay aligned.
+_BANNER_FONT: dict[str, tuple[str, str, str, str, str]] = {
+    "O": ("█████", "█   █", "█   █", "█   █", "█████"),
+    "M": ("█   █", "██ ██", "█ █ █", "█   █", "█   █"),
+    "N": ("█   █", "██  █", "█ █ █", "█  ██", "█   █"),
+    "I": ("█████", "  █  ", "  █  ", "  █  ", "█████"),
+    "-": ("     ", "     ", " ███ ", "     ", "     "),
+    "D": ("████ ", "█   █", "█   █", "█   █", "████ "),
+    "E": ("█████", "█    ", "███  ", "█    ", "█████"),
+    "V": ("█   █", "█   █", "█   █", " █ █ ", "  █  "),
+}
 
 
-def banner(subtitle: str = "agentic coding companion", console: Optional[Console] = None) -> RenderableType:
-    """Return the compact logo + title renderable, styled with ``app.banner``.
+def _ascii_word(word: str) -> list[str]:
+    """Render ``word`` as 5 rows of block letters using :data:`_BANNER_FONT`."""
+    rows = ["", "", "", "", ""]
+    for ch in word.upper():
+        glyph = _BANNER_FONT.get(ch)
+        if glyph is None:
+            glyph = ("     ",) * 5
+        for i in range(5):
+            rows[i] += glyph[i] + " "
+    return [r.rstrip() for r in rows]
 
-    Rendered once at startup and on ``/clear``.
+
+def banner(subtitle: str = "agentic coding companion · memory that never forgets",
+           console: Optional[Console] = None) -> RenderableType:
+    """Return the OMNI-DEV block-letter banner, styled with ``app.banner``.
+
+    Rendered once at startup and on ``/clear``. Falls back to a simple bold
+    wordmark if block glyphs can't be used (legacy/ASCII renderers).
     """
     lines: list[Text] = []
-    # Title line carries the banner accent; the small logo above it is muted so
-    # the title reads as the focal point.
-    lines.append(Text(_LOGO_LINES[0], style="app.muted"))
-    lines.append(
-        Text.assemble(
-            ("( o.o )  ", "app.muted"),
-            ("omni-dev", "app.banner"),
-        )
-    )
-    lines.append(
-        Text.assemble(
-            (" > ^ <   ", "app.muted"),
-            (subtitle, "app.muted"),
-        )
-    )
+
+    if should_use_ascii(console):
+        # Legacy/ASCII terminal: keep it simple but still clearly "OMNI-DEV".
+        lines.append(Text("OMNI-DEV", style="app.banner"))
+        lines.append(Text(subtitle, style="app.muted"))
+        return Group(*lines)
+
+    for row in _ascii_word("OMNI-DEV"):
+        lines.append(Text(row, style="app.banner"))
+    lines.append(Text(""))
+    lines.append(Text(subtitle, style="app.muted"))
     return Group(*lines)
 
 

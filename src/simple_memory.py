@@ -117,6 +117,19 @@ def recall(query: str, top_k: int = 8) -> List[str]:
     return [text for _, _, text in scored[:top_k]]
 
 
+def clear_all() -> bool:
+    """Erase all stored memories (truncate the JSON store to an empty list).
+
+    Used by the forget lifecycle when the scope is 'all'. Returns True on
+    success, False on failure.
+    """
+    try:
+        _save_memories([])
+        return True
+    except Exception:
+        return False
+
+
 def recall_recent(n: int = 5) -> List[str]:
     """Return the N most recent memories regardless of query."""
     memories = _load_memories()
