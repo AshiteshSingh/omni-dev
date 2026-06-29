@@ -32,6 +32,11 @@ import os
 from src.cli import theme as _theme
 _theme.enforce_utf8()
 
+# Pin Cognee's DATA + SYSTEM storage roots into the project's .cognee_data dir at
+# import time — BEFORE any cognee operation — so the knowledge graph is durable
+# and reinstall-proof (never under site-packages). Side-effecting import.
+from src import cognee_paths  # noqa: F401
+
 import io
 import asyncio
 import subprocess
@@ -50,6 +55,13 @@ for _logger in ["cognee", "OntologyAdapter", "litellm", "httpx", "alembic", "ale
     logging.getLogger(_logger).setLevel(logging.CRITICAL)
 logging.root.setLevel(logging.CRITICAL)
 os.environ["COGNEE_SKIP_CONNECTION_TEST"] = "true"
+try:
+    import litellm
+    litellm.suppress_debug_info = True   # no "Give Feedback / debug this error" banners
+    litellm.set_verbose = False
+    litellm.drop_params = True
+except Exception:
+    pass
 try:
     import loguru
     loguru.logger.remove()
@@ -73,11 +85,18 @@ SPINNERS["multi_squares"] = {
     "interval": 80,
     "frames": ["[#  ]", "[## ]", "[###]", "[ ##]", "[  #]", "[   ]"]
 }
+# Smooth braille spinner used for the agent "thinking" animation — the same
+# style modern coding CLIs use. 10 frames at 80ms reads as a continuous pulse.
+SPINNERS["omni_pulse"] = {
+    "interval": 80,
+    "frames": ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+}
 
 # ── Themed subsystems ──
 from src.cli.theme import (
     make_console, banner as theme_banner, status_footer,
-    format_tool_activity, tool_activity_indent,
+    format_tool_activity, tool_activity_indent, format_tool_result,
+    THINKING_VERBS,
     user_turn_header, assistant_turn_header, turn_separator, gutter_line,
 )
 from src.cli.render import render_final, render_error, render_diff
@@ -90,6 +109,7 @@ from src import history as cmd_history
 from src import transcript_store
 from src.cost_tracker import get_tracker
 from src.cli import onboarding
+from src.cli import ui_state
 from src import commands as commands_pkg
 
 from src.agent.core import OmniDevAgent
@@ -118,27 +138,55 @@ if not os.environ.get("OLLAMA_API_BASE"):
 
 
 def sync_cognee_config():
-    """Sync configuration dynamically into Cognee based on OMNI_MODEL and env vars."""
+    """Sync configuration dynamically into Cognee based on OMNI_MODEL and env vars.
+
+    Maps the active OMNI_MODEL onto a VALID Cognee LLM provider. Cognee v1.2.2
+    accepts these providers: openai, anthropic, gemini, ollama, mistral, custom,
+    azure, bedrock, llama_cpp. Anything that does not map cleanly (Vertex AI,
+    Groq, OpenRouter, ...) is routed through the ``custom`` provider with the full
+    litellm model string (e.g. ``vertex_ai/gemini-2.5-pro``), which Cognee passes
+    straight to litellm. The chosen hackathon path is Vertex AI via ADC creds.
+
+    Fully defensive — every cognee setter is wrapped so a config problem can never
+    crash the CLI.
+    """
     try:
+        # Ensure durable storage roots are pinned before any cognee operation.
+        try:
+            from src import cognee_paths
+            cognee_paths.configure_cognee_storage()
+        except Exception:
+            pass
+
         import cognee
 
         model_name = model_router.normalize_model(
-            os.environ.get("OMNI_MODEL", "vertex_ai/gemini-1.5-pro")
+            os.environ.get("OMNI_MODEL", "vertex_ai/gemini-2.5-pro")
         )
+
+        # Defaults (OpenAI) — overridden below based on the parsed provider.
         provider = "openai"
         model = "gpt-4o"
         api_key = ""
         endpoint = None
 
         if "/" in model_name:
-            parts = model_name.split("/", 1)
-            prov_prefix = parts[0].lower()
-            model_part = parts[1]
+            prov_prefix, model_part = model_name.split("/", 1)
+            prov_prefix = prov_prefix.lower()
 
-            if prov_prefix == "groq":
-                provider = "groq"
+            if prov_prefix == "vertex_ai":
+                # Vertex AI gemini via litellm. Cognee has no native vertex
+                # provider, so use "custom" with the FULL litellm string. Auth
+                # comes from ADC (GOOGLE_APPLICATION_CREDENTIALS + VERTEXAI_*),
+                # but some adapters require a non-empty key, so set a placeholder.
+                provider = "custom"
+                model = model_name  # "vertex_ai/<model>"
+                api_key = os.environ.get("GOOGLE_API_KEY", "") or "vertex-adc"
+            elif prov_prefix == "gemini":
+                # AI Studio Gemini — native cognee provider.
+                provider = "gemini"
                 model = model_part
-                api_key = os.environ.get("GROQ_API_KEY", "")
+                api_key = os.environ.get("GEMINI_API_KEY", "")
             elif prov_prefix == "openai":
                 provider = "openai"
                 model = model_part
@@ -147,14 +195,10 @@ def sync_cognee_config():
                 provider = "anthropic"
                 model = model_part
                 api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-            elif prov_prefix in ("gemini", "vertex_ai"):
-                provider = "google_gemini"
+            elif prov_prefix == "mistral":
+                provider = "mistral"
                 model = model_part
-                api_key = os.environ.get("GEMINI_API_KEY", "")
-            elif prov_prefix == "openrouter":
-                provider = "openrouter"
-                model = model_part
-                api_key = os.environ.get("OPENROUTER_API_KEY", "")
+                api_key = os.environ.get("MISTRAL_API_KEY", "")
             elif prov_prefix in ("ollama", "ollama_chat"):
                 provider = "ollama"
                 model = model_part
@@ -162,10 +206,23 @@ def sync_cognee_config():
                 endpoint = os.environ.get("OLLAMA_API_BASE")
                 if endpoint and endpoint.strip().rstrip("/") in ("https://ollama.com", "http://ollama.com"):
                     endpoint = "http://localhost:11434"
-            elif prov_prefix == "mistral":
-                provider = "mistral"
-                model = model_part
-                api_key = os.environ.get("MISTRAL_API_KEY", "")
+            elif prov_prefix == "groq":
+                # No native groq provider — route via custom + full litellm string.
+                provider = "custom"
+                model = model_name  # "groq/<model>"
+                api_key = os.environ.get("GROQ_API_KEY", "")
+            elif prov_prefix == "openrouter":
+                provider = "custom"
+                model = model_name  # "openrouter/<model>"
+                api_key = os.environ.get("OPENROUTER_API_KEY", "")
+            else:
+                # Any other prefixed model (deepseek, cohere, huggingface, ...).
+                provider = "custom"
+                model = model_name
+                api_key = (
+                    os.environ.get(prov_prefix.upper() + "_API_KEY", "")
+                    or os.environ.get("OPENROUTER_API_KEY", "")
+                )
         else:
             lower_m = model_name.lower()
             if "gpt" in lower_m or "o1" in lower_m or "o3" in lower_m:
@@ -177,26 +234,40 @@ def sync_cognee_config():
                 model = model_name
                 api_key = os.environ.get("ANTHROPIC_API_KEY", "")
             elif "gemini" in lower_m:
-                provider = "google_gemini"
+                provider = "gemini"
                 model = model_name
                 api_key = os.environ.get("GEMINI_API_KEY", "")
 
-        cognee.config.set_llm_provider(provider)
-        cognee.config.set_llm_model(model)
-        if api_key:
-            cognee.config.set_llm_api_key(api_key)
-        if endpoint:
-            cognee.config.set_llm_endpoint(endpoint)
+        def _try(method_name, *args):
+            fn = getattr(cognee.config, method_name, None)
+            if callable(fn):
+                try:
+                    fn(*args)
+                except Exception:
+                    pass
 
+        _try("set_llm_provider", provider)
+        _try("set_llm_model", model)
+        if api_key:
+            _try("set_llm_api_key", api_key)
+        if endpoint:
+            _try("set_llm_endpoint", endpoint)
+
+        # ── Embeddings ──
         if provider == "ollama":
-            cognee.config.set_embedding_provider("ollama")
-            cognee.config.set_embedding_model("nomic-embed-text")
+            _try("set_embedding_provider", "ollama")
+            _try("set_embedding_model", "nomic-embed-text")
+        elif os.environ.get("OPENAI_API_KEY"):
+            _try("set_embedding_provider", "openai")
+            _try("set_embedding_api_key", os.environ["OPENAI_API_KEY"])
         else:
-            if not os.environ.get("OPENAI_API_KEY"):
-                cognee.config.set_embedding_provider("fastembed")
-            else:
-                cognee.config.set_embedding_provider("openai")
-                cognee.config.set_embedding_api_key(os.environ["OPENAI_API_KEY"])
+            # Local, dependency-light embeddings via fastembed. The model must be
+            # one fastembed actually supports (the cognee default
+            # openai/text-embedding-3-large is not), so set a known-good fastembed
+            # model + its dimensionality explicitly (BAAI/bge-small-en-v1.5, 384).
+            _try("set_embedding_provider", "fastembed")
+            _try("set_embedding_model", "BAAI/bge-small-en-v1.5")
+            _try("set_embedding_dimensions", 384)
     except Exception:
         pass
 
@@ -370,6 +441,32 @@ def make_tool_callback(ui_state):
                         status.start()
                     except Exception:
                         pass
+            return
+
+        # Tool completion: a concise themed "└ result" line under the activity.
+        if func_name == "__tool_result__":
+            if status:
+                try:
+                    status.stop()
+                except Exception:
+                    pass
+            try:
+                line = format_tool_result(
+                    str(args.get("tool", "")),
+                    args.get("result", ""),
+                    bool(args.get("is_error", False)),
+                    args=args.get("args") if isinstance(args.get("args"), dict) else {},
+                    console=console,
+                )
+                if line is not None:
+                    console.print(line)
+            except Exception:
+                pass
+            if status:
+                try:
+                    status.start()
+                except Exception:
+                    pass
             return
 
         if status:
@@ -562,16 +659,13 @@ async def main():
 
     console.clear()
 
-    with console.status("[status.ok]Initializing Omni-Dev and loading memories...", spinner="multi_squares"):
+    with console.status("[status.ok]Initializing Omni-Dev and loading memories...", spinner="omni_pulse"):
         try:
-            import cognee as _cog
-            _data_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".cognee_data")
-            _data_root = os.path.normpath(_data_root)
-            os.makedirs(_data_root, exist_ok=True)
+            # Pin Cognee storage into the project (durable, reinstall-proof).
             try:
-                _cog.config.set_data_root_directory(_data_root)
+                cognee_paths.configure_cognee_storage()
             except Exception:
-                os.environ.setdefault("DATA_ROOT_DIRECTORY", _data_root)
+                pass
 
             agent = OmniDevAgent()
             _apply_persisted_config(agent)
@@ -598,6 +692,43 @@ async def main():
     except Exception:
         pass
 
+    # ── Best-effort Cognee startup recall (durable cross-session graph memory) ──
+    # Short, no-cognify search folded into startup_context. Wrapped in a strict
+    # timeout so a slow or failed Cognee never blocks startup.
+    cognee_parts = []
+    try:
+        async def _cognee_startup_recall():
+            import cognee
+            collected = []
+            try:
+                res = await cognee.recall(
+                    query_text="project context user preferences past work summary",
+                    top_k=5,
+                )
+            except Exception:
+                res = []
+            for r in (res or []):
+                text = None
+                for attr in ("answer", "text", "content", "context", "summary",
+                             "payload", "result", "graph_context", "value"):
+                    v = getattr(r, attr, None)
+                    if v and isinstance(v, str) and v.strip():
+                        text = v
+                        break
+                if not text:
+                    text = str(r)
+                if text and text.strip() and text.strip() not in collected:
+                    collected.append(text.strip())
+            return collected
+
+        cognee_parts = await asyncio.wait_for(_cognee_startup_recall(), timeout=15)
+    except Exception:
+        cognee_parts = []
+
+    if cognee_parts:
+        block = "\n\n<cognee_graph_memory>\n" + "\n\n".join(cognee_parts[:5]) + "\n</cognee_graph_memory>"
+        startup_context += block
+
     if startup_context:
         if agent.messages and agent.messages[0]["role"] == "system":
             agent.messages[0]["content"] += startup_context
@@ -620,6 +751,38 @@ async def main():
     ui_state = {"status": None}
     agent.can_use_tool = make_permission_callback(agent, ui_state)
     tool_callback = make_tool_callback(ui_state)
+
+    # Live token streaming: render the model response token-by-token. Enabled by
+    # default; set OMNI_NO_STREAM=1 to fall back to one-shot rendering. The first
+    # content token stops the spinner and prints the assistant header before the
+    # live view begins.
+    streaming_enabled = (
+        os.environ.get("OMNI_NO_STREAM", "").strip().lower()
+        not in ("1", "true", "yes", "on")
+    )
+    if streaming_enabled:
+        from src.cli import render as _render_mod
+
+        async def _stream_render(stream):
+            status = ui_state.get("status")
+
+            def _on_first():
+                if status is not None:
+                    try:
+                        status.stop()
+                    except Exception:
+                        pass
+                try:
+                    console.print()
+                    console.print(assistant_turn_header(console=console))
+                except Exception:
+                    pass
+
+            return await _render_mod.stream_response(
+                stream, console, on_first_chunk=_on_first
+            )
+
+        agent.stream_render = _stream_render
 
     # Transcript persistence state (Req 12.4 resume loads it back).
     transcript_state = {"id": None}
@@ -693,12 +856,16 @@ async def main():
         try:
             console.rule(style="app.muted")
             if use_prompt_toolkit:
-                user_input = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: session.prompt("> ")
-                )
+                # prompt_toolkit's async API runs on the main event loop. Running
+                # session.prompt() inside a thread executor breaks keyboard input
+                # on Windows (the win32 console reader must run on the main
+                # thread), which left the prompt unable to accept typing.
+                user_input = await session.prompt_async("> ")
             else:
                 from rich.prompt import Prompt
-                user_input = Prompt.ask(" [app.accent]>[/app.accent]")
+                user_input = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: Prompt.ask(" [app.accent]>[/app.accent]")
+                )
 
             cmd = user_input.strip()
             cmd_lower = cmd.lower()
@@ -928,7 +1095,7 @@ async def main():
                 console.print(f"\n[app.accent]/bug[/app.accent]")
                 if not description:
                     if use_prompt_toolkit:
-                        description = await asyncio.get_event_loop().run_in_executor(None, lambda: session.prompt("Describe the bug: "))
+                        description = await session.prompt_async("Describe the bug: ")
                     else:
                         from rich.prompt import Prompt
                         description = Prompt.ask("Describe the bug")
@@ -961,6 +1128,20 @@ async def main():
                 console.print(Panel(Markdown(report), title="[app.accent]Terminal Setup[/app.accent]", border_style="app.accent"))
                 continue
 
+            # ── /graph ──
+            if norm_cmd == "graph":
+                parts = user_input.strip().split(" ", 1)
+                sub_args = parts[1].strip() if len(parts) > 1 else ""
+                console.print(f"\n[app.accent]/graph[/app.accent]")
+                if sub_args.split(None, 1)[:1] == ["build"]:
+                    with console.status("[app.accent]Building knowledge graph..."):
+                        summary = await commands_pkg.graph_command(sub_args, console)
+                else:
+                    summary = await commands_pkg.graph_command(sub_args, console)
+                if summary:
+                    console.print(f"[app.muted]{summary}[/app.muted]")
+                continue
+
             # ── /resume ──
             if norm_cmd == "resume":
                 console.print(f"\n[app.accent]/resume[/app.accent]")
@@ -981,33 +1162,162 @@ async def main():
             if norm_cmd == "index":
                 import glob
                 console.print(f"\n[app.accent]{cmd}[/app.accent]")
-                with console.status("[app.accent]Indexing codebase into Cognee Graph Memory...", spinner="multi_squares"):
+                # Extensions worth ingesting as text. Everything else (binaries,
+                # images, lockfiles) is skipped so cognify stays fast and useful.
+                TEXT_EXT = {
+                    ".py", ".js", ".ts", ".tsx", ".jsx", ".md", ".txt", ".json",
+                    ".yaml", ".yml", ".toml", ".cfg", ".ini", ".html", ".css",
+                    ".scss", ".java", ".go", ".rs", ".c", ".cc", ".cpp", ".h",
+                    ".hpp", ".cs", ".rb", ".php", ".sh", ".bash", ".ps1", ".sql",
+                    ".kt", ".swift", ".scala", ".vue", ".svelte", ".r", ".jl",
+                    ".gradle", ".dockerfile", ".env.example",
+                }
+                MAX_FILE_BYTES = 60_000      # skip huge files (per-file cap)
+                MAX_TOTAL_FILES = 400        # bound cognify cost/time
+                MAX_TOTAL_BYTES = 2_500_000  # ~2.5 MB of text total
+                SKIP = ("node_modules", ".git", "venv", "__pycache__",
+                        ".cognee_data", "dist", "build", ".next", ".pytest_cache")
+                docs = []
+                files_added = 0
+                total_bytes = 0
+                with console.status("[app.accent]Reading & ingesting file contents into Cognee Graph Memory...", spinner="omni_pulse"):
                     import cognee
-                    files_added = 0
-                    file_texts = []
                     for filepath in glob.glob(os.path.join(".", "**", "*.*"), recursive=True):
-                        if any(x in filepath for x in ["node_modules", ".git", "venv", "__pycache__", ".env"]):
+                        if any(x in filepath for x in SKIP):
+                            continue
+                        ext = os.path.splitext(filepath)[1].lower()
+                        if ext not in TEXT_EXT:
                             continue
                         try:
-                            file_texts.append(f"Codebase File: {filepath}")
-                            files_added += 1
+                            if os.path.getsize(filepath) > MAX_FILE_BYTES:
+                                continue
+                            with open(filepath, "r", encoding="utf-8", errors="ignore") as fh:
+                                content = fh.read()
                         except Exception:
-                            pass
-                    if file_texts:
-                        combined = "\n".join(file_texts)
+                            continue
+                        if not content.strip():
+                            continue
+                        # Each file becomes its own document so Cognee extracts
+                        # per-file entities/relationships into the graph. The path
+                        # header lets recall attribute facts back to a file.
+                        doc = f"Source file: {filepath}\n\n{content}"
+                        docs.append(doc)
+                        files_added += 1
+                        total_bytes += len(content)
+                        if files_added >= MAX_TOTAL_FILES or total_bytes >= MAX_TOTAL_BYTES:
+                            break
+                    if docs:
                         try:
-                            await cognee.remember(combined, dataset_name="codebase_architecture")
-                        except Exception:
-                            await cognee.add(combined, dataset_name="codebase_architecture")
+                            # Ingest CONTENT (not just paths) and build the graph so
+                            # the knowledge survives even if the repo is deleted.
+                            await cognee.add(docs, dataset_name="codebase_architecture")
                             await cognee.cognify()
-                console.print(f"  [status.ok]{files_added} files indexed into Cognee Graph Memory.[/status.ok]")
+                        except Exception:
+                            # Fallback to the lifecycle API if add/cognify is unavailable.
+                            try:
+                                await cognee.remember(
+                                    "\n\n".join(docs[:50]),
+                                    dataset_name="codebase_architecture",
+                                )
+                            except Exception:
+                                pass
+                if files_added:
+                    console.print(
+                        f"  [status.ok]{files_added} files ({total_bytes // 1024} KB of code) "
+                        f"ingested into Cognee Graph Memory — durable across sessions.[/status.ok]"
+                    )
+                else:
+                    console.print("  [status.warn]No text/code files found to index here.[/status.warn]")
                 continue
 
+
             # ── /memory ──
+            # ── /forget (Cognee forget lifecycle) ──
+            if norm_cmd == "forget":
+                console.print(f"\n[app.accent]{cmd}[/app.accent]")
+                parts = user_input.strip().split()
+                # parts[0] is the command itself; the rest are args.
+                args = parts[1:] if len(parts) > 1 else []
+                scope = (args[0].lower() if args else "memory")
+                dataset_name = ""
+                if scope == "dataset":
+                    dataset_name = args[1] if len(args) > 1 else ""
+                    if not dataset_name:
+                        console.print("  [status.warn]Usage: /forget dataset <name>[/status.warn]")
+                        continue
+                elif scope not in ("memory", "all"):
+                    # Treat an unknown token as a dataset name.
+                    dataset_name = scope
+                    scope = "dataset"
+
+                with console.status("[app.accent]Forgetting memories...", spinner="omni_pulse"):
+                    msg = "the memory layer"
+                    try:
+                        import cognee
+                        try:
+                            cognee_paths.configure_cognee_storage()
+                        except Exception:
+                            pass
+                        if scope == "dataset":
+                            await cognee.forget(dataset=dataset_name)
+                            msg = f"dataset '{dataset_name}'"
+                        elif scope == "all":
+                            await cognee.forget(everything=True)
+                            try:
+                                from src.simple_memory import clear_all as _sm_clear
+                                _sm_clear()
+                            except Exception:
+                                pass
+                            msg = "all memories (local store cleared)"
+                        else:
+                            await cognee.forget(memory_only=True, dataset="user_memory")
+                            msg = "the memory layer"
+                    except Exception as e:
+                        # Honor 'all' offline even if Cognee fails.
+                        if scope == "all":
+                            try:
+                                from src.simple_memory import clear_all as _sm_clear
+                                _sm_clear()
+                                msg = "all memories (local store cleared; Cognee unavailable)"
+                            except Exception:
+                                msg = f"nothing — error: {e}"
+                        else:
+                            msg = f"nothing — error: {e}"
+                console.print(f"  [status.ok]🧹 Forgot {msg}.[/status.ok]")
+                continue
+
+            # ── /memify or /improve or /consolidate (Cognee memify + improve) ──
+            if norm_cmd in ("memify", "improve", "consolidate"):
+                console.print(f"\n[app.accent]{cmd}[/app.accent]")
+                with console.status("[app.accent]Consolidating & improving long-term memory...", spinner="omni_pulse"):
+                    ok = False
+                    try:
+                        import cognee
+                        try:
+                            cognee_paths.configure_cognee_storage()
+                        except Exception:
+                            pass
+                        try:
+                            await cognee.memify()
+                        except Exception:
+                            pass
+                        try:
+                            await cognee.improve(run_in_background=True)
+                        except Exception:
+                            pass
+                        ok = True
+                    except Exception:
+                        ok = False
+                if ok:
+                    console.print("  [status.ok]🧠 Memory consolidated.[/status.ok]")
+                else:
+                    console.print("  [status.warn]Memory consolidation unavailable (Cognee error). Local memory unaffected.[/status.warn]")
+                continue
+
             if norm_cmd == "memory":
                 console.print(f"\n[app.accent]{cmd}[/app.accent]")
                 if use_prompt_toolkit:
-                    query = await asyncio.get_event_loop().run_in_executor(None, lambda: session.prompt("What memory to recall? (or Enter for recent) "))
+                    query = await session.prompt_async("What memory to recall? (or Enter for recent) ")
                 else:
                     from rich.prompt import Prompt
                     query = Prompt.ask("What memory to recall? (or Enter for recent)")
@@ -1075,6 +1385,10 @@ async def main():
                 console.print(assistant_turn_header(console=console))
                 console.print("  [status.warn]The model returned an empty response.[/status.warn]")
                 console.print("  [app.muted]Try /model to switch providers, or /doctor to check your API key.[/app.muted]")
+            elif getattr(agent, "_final_was_streamed", False):
+                # Already rendered live token-by-token by the stream hook; just
+                # close the turn so we don't double-render the answer.
+                console.print(turn_separator("assistant", console=console))
             else:
                 console.print(assistant_turn_header(console=console))
                 render_final(final_response, console)
@@ -1104,12 +1418,43 @@ async def run_agent_task(agent, prompt, tool_callback, ui_state):
     loop stops at the next checkpoint and history stays consistent — the REPL is
     never killed (Req 7.12).
     """
-    status = console.status("[status.ok]Generating...", spinner="multi_squares")
+    status = console.status("[app.accent]Thinking[/app.accent]", spinner="omni_pulse", spinner_style="app.accent")
     try:
         status.start()
     except Exception:
         pass
     ui_state["status"] = status
+    # Register the spinner with the shared coordinator so mid-task input prompts
+    # (e.g. the ask_user tool) can pause it while waiting for the user.
+    try:
+        from src.cli import ui_state as ui_coord
+        ui_coord.set_active_status(status)
+    except Exception:
+        ui_coord = None
+
+    # ── Live status animation: one randomly-chosen verb + elapsed time + hint ──
+    # Mirrors Claude Code's spinner: pick a single whimsical verb per turn (not a
+    # rotating list) so the wait indicator feels alive but calm. Cancelled in finally.
+    import random as _random
+    _verb = _random.choice(THINKING_VERBS)
+
+    async def _animate():
+        import time as _t
+        start = _t.monotonic()
+        try:
+            while True:
+                elapsed = int(_t.monotonic() - start)
+                status.update(
+                    f"[app.accent]{_verb}\u2026[/app.accent]"
+                    f"[app.muted] · {elapsed}s · ctrl+c to interrupt[/app.muted]"
+                )
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
+
+    animator = asyncio.ensure_future(_animate())
 
     abort_event = asyncio.Event()
     task = asyncio.ensure_future(
@@ -1127,7 +1472,16 @@ async def run_agent_task(agent, prompt, tool_callback, ui_state):
     except Exception as exc:
         final = f"\U0001f6a8 Error during task: {exc}"
     finally:
+        try:
+            animator.cancel()
+        except Exception:
+            pass
         ui_state["status"] = None
+        if ui_coord is not None:
+            try:
+                ui_coord.clear_active_status()
+            except Exception:
+                pass
         try:
             status.stop()
         except Exception:
@@ -1187,7 +1541,7 @@ async def handle_resume(agent, transcript_state, session, use_prompt_toolkit):
     prompt_str = "Enter # to resume, 'f <#>' to fork, or Enter to cancel: "
     try:
         if use_prompt_toolkit and session is not None:
-            choice = await asyncio.get_event_loop().run_in_executor(None, lambda: session.prompt(prompt_str))
+            choice = await session.prompt_async(prompt_str)
         else:
             from rich.prompt import Prompt
             choice = await asyncio.get_event_loop().run_in_executor(None, lambda: Prompt.ask(prompt_str.strip(), default=""))
@@ -1234,6 +1588,30 @@ async def handle_resume(agent, transcript_state, session, use_prompt_toolkit):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Shared interactive line reader.
+#
+# CRITICAL (Windows): the win32 console reader prompt_toolkit installs must run
+# on the main event-loop thread. Reading sub-prompts via rich.Prompt.ask inside
+# run_in_executor (a worker thread) corrupts that reader, so the FIRST /model or
+# /api_key works but every prompt afterwards stops accepting input. Always reuse
+# the active prompt_toolkit session (as /memory and /resume already do).
+# ─────────────────────────────────────────────────────────────────────────────
+async def _ask_line(session, use_prompt_toolkit, prompt_text, is_password=False):
+    if use_prompt_toolkit and session is not None:
+        try:
+            ans = await session.prompt_async(prompt_text, is_password=is_password)
+            return (ans or "").strip()
+        except Exception:
+            pass
+    from rich.prompt import Prompt as RPrompt
+    label = prompt_text.rstrip(": ").strip() or prompt_text
+    ans = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: RPrompt.ask(label, password=is_password)
+    )
+    return (ans or "").strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # /model handler (routes every choice through the Model Router) — Req 5.2
 # ─────────────────────────────────────────────────────────────────────────────
 async def handle_model_command(user_input, session, use_prompt_toolkit):
@@ -1248,21 +1626,19 @@ async def handle_model_command(user_input, session, use_prompt_toolkit):
         console.print("    3. OpenAI (gpt-4o)")
         console.print("    4. Anthropic (claude-3-5-sonnet-20241022)")
         console.print("    5. Google Gemini Studio API (gemini/gemini-1.5-pro)")
-        console.print("    6. Google Vertex AI (vertex_ai/gemini-1.5-pro)")
+        console.print("    6. Google Vertex AI (vertex_ai/gemini-2.5-flash)")
         console.print("    7. OpenRouter Claude 3.5 Sonnet (openrouter/anthropic/claude-3.5-sonnet)")
         console.print("    8. OpenRouter Gemini Pro (openrouter/google/gemini-pro-1.5)")
         console.print("    9. Ollama (Local or Cloud API) (ollama/llama3.3)")
         console.print("   10. Custom model string")
-        from rich.prompt import Prompt as RPrompt
-        choice = await asyncio.get_event_loop().run_in_executor(None, lambda: RPrompt.ask("Enter choice (1-10)"))
-        choice = (choice or "").strip()
+        choice = await _ask_line(session, use_prompt_toolkit, "Enter choice (1-10): ")
         model_map = {
             "1": "groq/openai/gpt-oss-120b",
             "2": "groq/llama-3.3-70b-versatile",
             "3": "gpt-4o",
             "4": "claude-3-5-sonnet-20241022",
             "5": "gemini/gemini-1.5-pro",
-            "6": "vertex_ai/gemini-1.5-pro",
+            "6": "vertex_ai/gemini-2.5-flash",
             "7": "openrouter/anthropic/claude-3.5-sonnet",
             "8": "openrouter/google/gemini-pro-1.5",
             "9": "ollama/llama3.3",
@@ -1270,8 +1646,7 @@ async def handle_model_command(user_input, session, use_prompt_toolkit):
         if choice in model_map:
             new_model = model_map[choice]
         else:
-            new_model = await asyncio.get_event_loop().run_in_executor(None, lambda: RPrompt.ask("Enter litellm model string"))
-            new_model = (new_model or "").strip()
+            new_model = await _ask_line(session, use_prompt_toolkit, "Enter litellm model string: ")
 
     if not new_model:
         console.print("  [status.warn]No model provided.[/status.warn]")
@@ -1337,9 +1712,7 @@ async def handle_api_key_command(user_input, session, use_prompt_toolkit):
         console.print("    9. Ollama Cloud API Base URL (OLLAMA_API_BASE)")
         console.print("   10. Ollama Cloud API Key (OLLAMA_API_KEY)")
         console.print("   11. Custom env var name")
-        from rich.prompt import Prompt as RPrompt
-        choice = await asyncio.get_event_loop().run_in_executor(None, lambda: RPrompt.ask("Enter choice (1-11)"))
-        choice = (choice or "").strip()
+        choice = await _ask_line(session, use_prompt_toolkit, "Enter choice (1-11): ")
         provider_map = {
             "1": "GROQ_API_KEY",
             "2": "OPENAI_API_KEY",
@@ -1355,14 +1728,13 @@ async def handle_api_key_command(user_input, session, use_prompt_toolkit):
         if choice in provider_map:
             provider_key = provider_map[choice]
         else:
-            provider_key = await asyncio.get_event_loop().run_in_executor(None, lambda: RPrompt.ask("Enter env var name"))
-            provider_key = (provider_key or "").strip().upper()
+            provider_key = await _ask_line(session, use_prompt_toolkit, "Enter env var name: ")
+            provider_key = provider_key.upper()
             if "PROJECT" not in provider_key and "LOCATION" not in provider_key and "BASE" not in provider_key and not provider_key.endswith("_API_KEY"):
                 provider_key += "_API_KEY"
 
         is_secret = "PROJECT" not in provider_key and "LOCATION" not in provider_key and "BASE" not in provider_key
-        key_value = await asyncio.get_event_loop().run_in_executor(None, lambda: RPrompt.ask(f"Enter {provider_key}", password=is_secret))
-        key_value = (key_value or "").strip()
+        key_value = await _ask_line(session, use_prompt_toolkit, f"Enter {provider_key}: ", is_password=is_secret)
 
     if key_value:
         os.environ[provider_key] = key_value
