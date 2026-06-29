@@ -15,6 +15,7 @@ from .release_notes import release_notes_command
 from .terminal_setup import terminal_setup_command
 from .clear import clear_command
 from .resume import list_resumable, resume_command, fork_command
+from .graph_cmd import graph_command
 
 #: Registry of built-in / ported commands. The interface (and the `/help`
 #: listing, Req 16.9) reads this so every command — including the ported utility
@@ -33,6 +34,9 @@ COMMANDS = [
     {"name": "terminal-setup", "description": "Configure a Shift+Enter newline key binding for your terminal."},
     {"name": "clear", "description": "Reset the conversation history and free up context."},
     {"name": "resume", "description": "List, resume, or fork a previous conversation."},
+    {"name": "graph", "description": "Build, query, or explore the codebase knowledge graph (build | query <text> | neighborhood <name>)."},
+    {"name": "forget", "description": "Forget stored memories (memory | all | dataset <name>) — Cognee forget lifecycle."},
+    {"name": "memify", "description": "Consolidate & improve long-term memory (Cognee memify/improve)."},
     {"name": "help", "description": "List all available commands."},
 ]
 
@@ -57,6 +61,7 @@ __all__ = [
     "list_resumable",
     "resume_command",
     "fork_command",
+    "graph_command",
     "COMMANDS",
     "get_all_command_names",
 ]
