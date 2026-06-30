@@ -2,7 +2,7 @@
   Omni-Dev installer (Windows / PowerShell)
 
   One-line install:
-    irm https://raw.githubusercontent.com/AshiteshSingh/gemini-graph-mind/main/install.ps1 | iex
+    irm https://raw.githubusercontent.com/AshiteshSingh/omni-dev/main/install.ps1 | iex
 
   What it does:
     1. Clones (or updates) the repo into  %LOCALAPPDATA%\omni-dev
@@ -13,7 +13,7 @@
 
 param(
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA "omni-dev"),
-    [string]$Repo       = "https://github.com/AshiteshSingh/gemini-graph-mind",
+    [string]$Repo       = "https://github.com/AshiteshSingh/omni-dev",
     [string]$Branch     = "main",
     [string]$BinDir     = (Join-Path $env:USERPROFILE ".omni\bin")
 )
