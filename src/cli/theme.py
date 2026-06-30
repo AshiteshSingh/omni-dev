@@ -469,24 +469,54 @@ def _ascii_word(word: str) -> list[str]:
 
 def banner(subtitle: str = "agentic coding companion · memory that never forgets",
            console: Optional[Console] = None) -> RenderableType:
-    """Return the OMNI-DEV block-letter banner, styled with ``app.banner``.
+    """Return a Claude-Code-style welcome box: a sparkle + title and a couple of
+    tip lines inside a rounded panel, styled with the red accent.
 
-    Rendered once at startup and on ``/clear``. Falls back to a simple bold
-    wordmark if block glyphs can't be used (legacy/ASCII renderers).
+    Rendered once at startup and on ``/clear``.
     """
-    lines: list[Text] = []
+    from rich.panel import Panel
+    from rich.box import ROUNDED, ASCII as ASCII_BOX
 
-    if should_use_ascii(console):
-        # Legacy/ASCII terminal: keep it simple but still clearly "OMNI-DEV".
-        lines.append(Text("OMNI-DEV", style="app.banner"))
-        lines.append(Text(subtitle, style="app.muted"))
-        return Group(*lines)
+    ascii_mode = should_use_ascii(console)
+    spark = "*" if ascii_mode else "\u273b"   # ✻
+    box = ASCII_BOX if ascii_mode else ROUNDED
 
-    for row in _ascii_word("OMNI-DEV"):
-        lines.append(Text(row, style="app.banner"))
-    lines.append(Text(""))
-    lines.append(Text(subtitle, style="app.muted"))
-    return Group(*lines)
+    try:
+        cwd = os.getcwd()
+    except Exception:
+        cwd = "."
+
+    title = Text()
+    title.append(f"{spark} ", style="app.banner")
+    title.append("Welcome to Omni-Dev", style="bold #E5484D")
+
+    tip = Text()
+    tip.append("/help", style="app.accent")
+    tip.append(" for commands  ", style="app.muted")
+    tip.append("/model", style="app.accent")
+    tip.append(" to switch model  ", style="app.muted")
+    tip.append("?", style="app.accent")
+    tip.append(" for shortcuts", style="app.muted")
+
+    cwd_line = Text()
+    cwd_line.append("cwd: ", style="app.muted")
+    cwd_line.append(cwd, style="app.muted")
+
+    body = Group(
+        title,
+        Text(""),
+        Text(subtitle, style="app.muted"),
+        Text(""),
+        tip,
+        cwd_line,
+    )
+    return Panel(
+        body,
+        box=box,
+        border_style="app.accent",
+        padding=(0, 2),
+        expand=False,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
