@@ -1513,12 +1513,30 @@ async def main():
             final_response = await run_agent_task(agent, augmented_prompt, tool_callback, ui_state)
 
             # Journaling (SimpleMemory + best-effort background Cognee).
+            # Skip error/notice responses (API-key errors, interrupts, config
+            # errors, empty-response notices) so failures never pollute memory and
+            # resurface as confusing context on later sessions.
             from src.simple_memory import remember as sm_remember
-            try:
-                journal_entry = f"[{__import__('time').strftime('%Y-%m-%d')}] User: {user_input[:200]}\nOmni-Dev: {final_response[:400]}"
-                sm_remember(journal_entry)
-            except Exception:
-                pass
+
+            def _is_journalable(resp: str) -> bool:
+                if not resp or not resp.strip():
+                    return False
+                low = resp.lower()
+                markers = (
+                    "\U0001f6a8", "\u26a0",  # 🚨 ⚠️
+                    "api key", "api_key", "authenticationerror",
+                    "configuration error", "connectivity error",
+                    "empty response", "interrupted", "error during task",
+                )
+                return not any(m in low for m in markers)
+
+            journalable = _is_journalable(final_response)
+            if journalable:
+                try:
+                    journal_entry = f"[{__import__('time').strftime('%Y-%m-%d')}] User: {user_input[:200]}\nOmni-Dev: {final_response[:400]}"
+                    sm_remember(journal_entry)
+                except Exception:
+                    pass
 
             async def _bg_cognee_journal():
                 try:
@@ -1531,7 +1549,8 @@ async def main():
                             pass
                 except Exception:
                     pass
-            asyncio.ensure_future(_bg_cognee_journal())
+            if journalable:
+                asyncio.ensure_future(_bg_cognee_journal())
 
             # Render the final assistant response.
             console.print()
