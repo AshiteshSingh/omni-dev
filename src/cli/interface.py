@@ -353,8 +353,24 @@ def command_meta(cmd: str) -> str:
     if cmd in COMMAND_DESCRIPTIONS:
         return COMMAND_DESCRIPTIONS[cmd]
     if cmd.startswith("/"):
-        return "Run the " + cmd[1:].replace("-", " ").replace("_", " ") + " command"
+        return "Run the " + cmd[1:].replace("-", "_").replace("_", " ") + " command"
     return ""
+
+
+def print_input_footer() -> None:
+    """Print the antigravity-style status line: '? for shortcuts' on the left and
+    the model on the right. Used on the Rich fallback path (the prompt_toolkit
+    path shows this as a live bottom toolbar instead)."""
+    try:
+        width = console.size.width
+    except Exception:
+        width = 80
+    left = "? for shortcuts"
+    right = pretty_model()
+    pad = max(1, width - len(left) - len(right) - 2)
+    console.print(
+        f"  [app.muted]{left}[/app.muted]" + " " * pad + f"[app.muted]{right}[/app.muted]"
+    )
 
 
 def print_banner():
@@ -1018,6 +1034,7 @@ async def main():
                 user_input = await session.prompt_async(_HTML('<prompt>&gt;</prompt> '))
             else:
                 from rich.prompt import Prompt
+                print_input_footer()
                 user_input = await asyncio.get_event_loop().run_in_executor(
                     None, lambda: Prompt.ask(" [app.accent]>[/app.accent]")
                 )
