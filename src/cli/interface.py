@@ -154,11 +154,15 @@ def sync_cognee_config():
         except Exception:
             pass
 
+        # No model configured yet: nothing to map onto Cognee. Do NOT assume a
+        # provider/model here — the user picks one via /model or OMNI_MODEL.
+        raw_model = os.environ.get("OMNI_MODEL", "").strip()
+        if not raw_model:
+            return
+
         import cognee
 
-        model_name = model_router.normalize_model(
-            os.environ.get("OMNI_MODEL", "vertex_ai/gemini-2.5-pro")
-        )
+        model_name = model_router.normalize_model(raw_model)
 
         # Defaults (OpenAI) — overridden below based on the parsed provider.
         provider = "openai"
@@ -268,6 +272,19 @@ def sync_cognee_config():
         pass
 
 
+def _run_cognee_sync_in_background() -> None:
+    """Run :func:`sync_cognee_config` off the main thread.
+
+    ``sync_cognee_config`` performs ``import cognee``, which is heavy (several
+    seconds). Calling it synchronously from an interactive handler makes the
+    prompt appear to hang after a model/key change. Running it in a daemon
+    thread keeps the CLI responsive; the synced config is only needed by the
+    next memory operation, which happens later.
+    """
+    import threading
+    threading.Thread(target=sync_cognee_config, daemon=True).start()
+
+
 # ── Themed console (single source of style) ──
 console = make_console(highlight=False)
 
@@ -286,7 +303,10 @@ def get_git_branch() -> str:
 
 
 def current_model() -> str:
-    return os.environ.get("OMNI_MODEL", "groq/openai/gpt-oss-120b").strip()
+    # No provider is hardcoded: the model is whatever the user configured via
+    # OMNI_MODEL (.env or /model). Empty means "not yet chosen" — the caller
+    # prompts the user to pick one rather than silently assuming a provider.
+    return os.environ.get("OMNI_MODEL", "").strip()
 
 
 def pretty_model(model: str = "") -> str:
@@ -749,7 +769,7 @@ async def main():
 
             agent = OmniDevAgent()
             _apply_persisted_config(agent)
-            sync_cognee_config()
+            _run_cognee_sync_in_background()
         except Exception as e:
             render_error(f"Failed to initialize agent: {e}", console)
             return
@@ -1626,6 +1646,14 @@ async def main():
                 continue
 
             # ── Regular agent task ──
+            # Require an explicitly chosen model — no provider is hardcoded.
+            if not current_model():
+                console.print(
+                    "  [status.warn]No model selected.[/status.warn] Run "
+                    "[app.accent]/model[/app.accent] to choose one (any LiteLLM model "
+                    "string), or set [app.accent]OMNI_MODEL[/app.accent] in your .env, then retry."
+                )
+                continue
             from src.simple_memory import recall as _sm_recall
             past_context = ""
             try:
@@ -1947,33 +1975,17 @@ async def handle_model_command(user_input, session, use_prompt_toolkit):
     if len(parts) == 2:
         new_model = parts[1].strip()
     else:
-        console.print("  Select an LLM Provider/Model:")
-        console.print("    1. Groq (groq/openai/gpt-oss-120b)")
-        console.print("    2. Groq (groq/llama-3.3-70b-versatile)")
-        console.print("    3. OpenAI (gpt-4o)")
-        console.print("    4. Anthropic (claude-3-5-sonnet-20241022)")
-        console.print("    5. Google Gemini Studio API (gemini/gemini-1.5-pro)")
-        console.print("    6. Google Vertex AI (vertex_ai/gemini-2.5-flash)")
-        console.print("    7. OpenRouter Claude 3.5 Sonnet (openrouter/anthropic/claude-3.5-sonnet)")
-        console.print("    8. OpenRouter Gemini Pro (openrouter/google/gemini-pro-1.5)")
-        console.print("    9. Ollama (Local or Cloud API) (ollama/llama3.3)")
-        console.print("   10. Custom model string")
-        choice = await _ask_line(session, use_prompt_toolkit, "Enter choice (1-10): ")
-        model_map = {
-            "1": "groq/openai/gpt-oss-120b",
-            "2": "groq/llama-3.3-70b-versatile",
-            "3": "gpt-4o",
-            "4": "claude-3-5-sonnet-20241022",
-            "5": "gemini/gemini-1.5-pro",
-            "6": "vertex_ai/gemini-2.5-flash",
-            "7": "openrouter/anthropic/claude-3.5-sonnet",
-            "8": "openrouter/google/gemini-pro-1.5",
-            "9": "ollama/llama3.3",
-        }
-        if choice in model_map:
-            new_model = model_map[choice]
-        else:
-            new_model = await _ask_line(session, use_prompt_toolkit, "Enter litellm model string: ")
+        console.print("  Enter the model you want to use, in LiteLLM format.")
+        console.print("  [app.muted]Format: <provider>/<model>  (or a bare OpenAI/Anthropic model name)[/app.muted]")
+        console.print("  [app.muted]Examples:[/app.muted]")
+        console.print("    [app.muted]gemini/gemini-1.5-pro         - Google AI Studio[/app.muted]")
+        console.print("    [app.muted]vertex_ai/gemini-2.5-flash    - Google Vertex AI[/app.muted]")
+        console.print("    [app.muted]gpt-4o                        - OpenAI[/app.muted]")
+        console.print("    [app.muted]claude-3-5-sonnet-20241022    - Anthropic[/app.muted]")
+        console.print("    [app.muted]groq/llama-3.3-70b-versatile  - Groq[/app.muted]")
+        console.print("    [app.muted]ollama/llama3.3               - local Ollama[/app.muted]")
+        console.print("  [app.muted]Full provider list: https://docs.litellm.ai/docs/providers[/app.muted]")
+        new_model = await _ask_line(session, use_prompt_toolkit, "Enter model string: ")
 
     if not new_model:
         console.print("  [status.warn]No model provided.[/status.warn]")
@@ -2006,9 +2018,10 @@ async def handle_model_command(user_input, session, use_prompt_toolkit):
                 pass
             decision = model_router.route(canonical, os.environ)
 
-    sync_cognee_config()
-
     console.print(f"  [status.ok]Model switched to:[/status.ok] {decision.canonical_model}")
+    # Sync Cognee's LLM config off the main thread so the heavy `import cognee`
+    # never blocks the prompt after a model switch.
+    _run_cognee_sync_in_background()
     if decision.error:
         console.print(f"  [status.warn]{decision.error}[/status.warn]")
     elif not tool_policy.supports_tools(decision):
@@ -2080,7 +2093,7 @@ async def handle_api_key_command(user_input, session, use_prompt_toolkit):
             set_key(".env", provider_key, key_value)
         except Exception:
             pass
-        sync_cognee_config()
+        _run_cognee_sync_in_background()
         console.print(f"  [status.ok]API key saved:[/status.ok] {provider_key}")
 
 
