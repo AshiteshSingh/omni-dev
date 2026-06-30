@@ -14,3 +14,9 @@ build/
 
 # Scratch / reference repo (local only, not part of the published project)
 scratch_repo/
+
+# Local-only artifacts and scratch dirs (not part of the published project)
+_emb_probe_out.txt
+browser_shot.png
+cijoy/
+tm/
