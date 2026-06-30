@@ -329,6 +329,8 @@ COMMAND_DESCRIPTIONS = {
     "/api_key": "Add an API key to your .env",
     "/cognee": "Set memory embeddings: same as the CLI (cloud) or local (offline)",
     "/autonomous": "Toggle autonomous (no-permission) mode",
+    "/plan": "Create a step-by-step plan only (type 'proceed' to implement it)",
+    "/developer": "Developer mode: autonomously plan, implement, and build step by step",
     "/config": "View or edit configuration",
     "/ctx_viz": "Visualize the current context window",
     "/tokens": "Show token usage for this session",
@@ -603,7 +605,7 @@ def build_commands_list() -> list:
     # Runtime-only / aliased commands handled directly by this interface.
     extras = [
         "/tokens", "/cost", "/status", "/model", "/api_key", "/cognee", "/memory", "/index",
-        "/history", "/commit", "/pwd", "/ls", "/autonomous",
+        "/history", "/commit", "/pwd", "/ls", "/autonomous", "/plan", "/developer",
         "/ctx_viz", "/pr_comments", "/release_notes", "/terminal_setup",
         "exit", "quit", "?",
     ]
@@ -837,6 +839,10 @@ async def main():
 
     # ── Shared UI state + injected callbacks ──
     ui_state = {"status": None}
+    # /plan stores a pending task here; typing 'proceed' executes it. Developer
+    # mode makes the agent plan -> implement -> build autonomously each turn.
+    plan_state = {"task": None}
+    dev_mode = {"on": False}
     agent.can_use_tool = make_permission_callback(agent, ui_state)
     tool_callback = make_tool_callback(ui_state)
 
@@ -1565,6 +1571,58 @@ async def main():
                     console.print("  [status.warn]No memories found yet.[/status.warn]")
                 continue
 
+            # ── /developer (toggle autonomous plan->implement->build mode) ──
+            if norm_cmd in ("developer", "dev"):
+                dev_mode["on"] = not dev_mode["on"]
+                if dev_mode["on"]:
+                    agent.autonomous = True
+                    console.print("\n[status.ok]Developer mode ON[/status.ok]")
+                    console.print("  [app.muted]I'll plan, implement, and build step by step, autonomously, each turn.[/app.muted]")
+                else:
+                    agent.autonomous = os.environ.get("OMNI_AUTONOMOUS", "false").strip().lower() in ("1", "true", "yes", "on")
+                    console.print("\n[status.warn]Developer mode OFF[/status.warn]")
+                continue
+
+            # ── /plan (produce a plan only; 'proceed' implements it) ──
+            if norm_cmd == "plan":
+                parts = user_input.strip().split(" ", 1)
+                task = parts[1].strip() if len(parts) > 1 else ""
+                console.print("\n[app.accent]/plan[/app.accent]")
+                if not task:
+                    task = (await _ask_line(session, use_prompt_toolkit, "What should I plan? ")).strip()
+                if not task:
+                    console.print("  [status.warn]No task provided.[/status.warn]")
+                    continue
+                plan_prompt = (
+                    "Create a concise, numbered step-by-step IMPLEMENTATION PLAN for the task below. "
+                    "Output ONLY the plan as markdown. Do NOT modify files, run commands, or use mutating tools yet — "
+                    "this is planning only.\n\n"
+                    f"TASK: {task}"
+                )
+                console.print()
+                console.print(user_turn_header(console=console))
+                console.print(gutter_line(user_input, role="user", console=console))
+                console.print(turn_separator("user", console=console))
+                final_response = await run_agent_task(agent, plan_prompt, tool_callback, ui_state)
+                render_task_result(agent, final_response)
+                plan_state["task"] = task
+                console.print("  [app.muted]Type 'proceed' to implement this plan, or refine and /plan again.[/app.muted]")
+                continue
+
+            # ── proceed (execute the pending /plan) ──
+            if cmd_lower in ("proceed", "/proceed", "go", "go ahead", "yes proceed", "do it") and plan_state.get("task"):
+                task = plan_state["task"]
+                plan_state["task"] = None
+                console.print("\n[app.accent]Proceeding with the plan...[/app.accent]")
+                exec_prompt = (
+                    "Implement the following task fully, following the plan you just produced. "
+                    "Build and verify it, fixing any errors as you go.\n\n"
+                    f"TASK: {task}"
+                )
+                final_response = await run_agent_task(agent, exec_prompt, tool_callback, ui_state)
+                render_task_result(agent, final_response)
+                continue
+
             # ── Regular agent task ──
             from src.simple_memory import recall as _sm_recall
             past_context = ""
@@ -1575,6 +1633,13 @@ async def main():
             except Exception:
                 pass
             augmented_prompt = f"{user_input}{past_context}"
+            if dev_mode["on"]:
+                augmented_prompt = (
+                    "DEVELOPER MODE: Work fully autonomously. First outline a brief step-by-step plan, then "
+                    "implement it step by step — writing code, running builds/tests, and fixing errors as you go — "
+                    "until the task is fully complete and verified.\n\n"
+                    + augmented_prompt
+                )
 
             # Echo the user turn (themed framing).
             console.print()
@@ -1655,6 +1720,21 @@ async def main():
 # ─────────────────────────────────────────────────────────────────────────────
 # Task execution + budget helpers
 # ─────────────────────────────────────────────────────────────────────────────
+def render_task_result(agent, final_response):
+    """Render a task result like the main REPL turn: skip a second render if the
+    stream hook already showed it, else render the markdown."""
+    console.print()
+    if not final_response or not final_response.strip():
+        console.print(assistant_turn_header(console=console))
+        console.print("  [status.warn]The model returned an empty response.[/status.warn]")
+    elif getattr(agent, "_final_was_streamed", False):
+        console.print(turn_separator("assistant", console=console))
+    else:
+        console.print(assistant_turn_header(console=console))
+        render_final(final_response, console)
+        console.print(turn_separator("assistant", console=console))
+
+
 async def run_agent_task(agent, prompt, tool_callback, ui_state):
     """Run the agent with an active spinner; Ctrl+C interrupts cleanly (Req 1.7, 7.11).
 
