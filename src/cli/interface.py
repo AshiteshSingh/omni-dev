@@ -327,6 +327,7 @@ COMMAND_DESCRIPTIONS = {
     "/index": "Index this codebase into graph memory",
     "/model": "Switch the active model",
     "/api_key": "Add an API key to your .env",
+    "/embedding": "Choose the embedding model: cloud or local (offline)",
     "/autonomous": "Toggle autonomous (no-permission) mode",
     "/config": "View or edit configuration",
     "/ctx_viz": "Visualize the current context window",
@@ -589,7 +590,7 @@ def build_commands_list() -> list:
     base = ["/" + name for name in commands_pkg.get_all_command_names()]
     # Runtime-only / aliased commands handled directly by this interface.
     extras = [
-        "/tokens", "/cost", "/status", "/model", "/api_key", "/memory", "/index",
+        "/tokens", "/cost", "/status", "/model", "/api_key", "/embedding", "/memory", "/index",
         "/history", "/commit", "/pwd", "/ls", "/autonomous",
         "/ctx_viz", "/pr_comments", "/release_notes", "/terminal_setup",
         "exit", "quit", "?",
@@ -1310,6 +1311,71 @@ async def main():
             # ── /api_key ──
             if norm_cmd == "api_key":
                 await handle_api_key_command(user_input, session, use_prompt_toolkit)
+                continue
+
+            # ── /embedding (choose cloud vs local embedding model) ──
+            if norm_cmd in ("embedding", "embeddings"):
+                console.print("\n[app.accent]/embedding[/app.accent]")
+                prov, model, dims = cognee_paths.get_embedding_info()
+                console.print(f"  [app.muted]Current:[/app.muted] {prov or '?'} / {model or '?'} ({dims or '?'} dims)")
+                console.print("  Select an embedding model for graph memory:")
+                console.print("    1. Cloud  — Vertex text-embedding-004 (768d, uses your cloud creds)")
+                console.print("    2. Local  — fastembed BAAI/bge-small-en-v1.5 (384d, fully offline)")
+                console.print("    3. Local  — Ollama nomic-embed-text (768d, needs 'ollama serve')")
+                console.print("    4. Custom — enter provider, model, dimensions")
+                choice = (await _ask_line(session, use_prompt_toolkit, "Enter choice (1-4): ")).strip()
+                preset_map = {"1": "cloud", "2": "local", "3": "ollama"}
+                if choice in preset_map:
+                    nprov, nmodel, ndims, nendpoint = cognee_paths.EMBEDDING_PRESETS[preset_map[choice]]
+                elif choice == "4":
+                    spec = (await _ask_line(session, use_prompt_toolkit, "Enter: <provider> <model> <dimensions>: ")).split()
+                    if len(spec) < 3:
+                        console.print("  [status.warn]Need provider, model and dimensions.[/status.warn]")
+                        continue
+                    nprov, nmodel, ndims, nendpoint = spec[0], spec[1], spec[2], ""
+                else:
+                    console.print("  [status.warn]Cancelled.[/status.warn]")
+                    continue
+
+                if nprov == "fastembed":
+                    try:
+                        import fastembed  # noqa: F401
+                    except Exception:
+                        console.print("  [status.warn]The local embedding engine ('fastembed') isn't installed.[/status.warn]")
+                        ans = (await _ask_line(session, use_prompt_toolkit, "Install it now (one-time download)? [y/N]: ")).strip().lower()
+                        if not ans.startswith("y"):
+                            console.print("  [app.muted]Cancelled. Install manually:  pip install fastembed[/app.muted]")
+                            continue
+                        import sys as _sys
+                        import subprocess as _sp
+                        with console.status("[app.accent]Installing fastembed (this can take a minute)...", spinner="omni_pulse"):
+                            _sp.run([_sys.executable, "-m", "pip", "install", "fastembed"],
+                                    capture_output=True, text=True)
+                        try:
+                            import fastembed  # noqa: F401
+                            console.print("  [status.ok]fastembed installed.[/status.ok]")
+                        except Exception:
+                            console.print("  [status.warn]Install failed. Try manually:  pip install fastembed[/status.warn]")
+                            continue
+                if nprov == "ollama":
+                    console.print("  [app.muted]Note: run 'ollama serve' and 'ollama pull nomic-embed-text' first.[/app.muted]")
+
+                changed = (str(ndims) != str(dims)) if dims else True
+                if changed:
+                    console.print(f"  [status.warn]Embedding dimensions change ({dims or '?'} -> {ndims}).[/status.warn]")
+                    console.print("  [status.warn]Existing graph-memory vectors won't match the new model and must be rebuilt.[/status.warn]")
+                    ans = (await _ask_line(session, use_prompt_toolkit, "Back up & reset the memory vector store now? [y/N]: ")).strip().lower()
+                    if ans.startswith("y"):
+                        dest = cognee_paths.backup_databases(label=f"dim{dims or 'x'}")
+                        if dest:
+                            console.print(f"  [status.ok]Backed up old store -> {os.path.basename(dest)}[/status.ok]")
+                        else:
+                            console.print("  [app.muted]No existing store to back up.[/app.muted]")
+
+                cognee_paths.set_embedding(nprov, nmodel, ndims, nendpoint)
+                console.print(f"  [status.ok]Embedding model set:[/status.ok] {nprov} / {nmodel} ({ndims} dims)")
+                console.print("  [app.muted]Restart Omni-Dev for it to take effect, then run /index to rebuild memory.[/app.muted]")
+                console.print("  [app.muted]Facts saved via 'remember' (offline store) are unaffected.[/app.muted]")
                 continue
 
             # ── /index ──

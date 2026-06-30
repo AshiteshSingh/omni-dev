@@ -197,6 +197,72 @@ def _cognee_provider_for(model: str) -> tuple[str, str]:
     return "custom", (os.environ.get("LLM_API_KEY") or "litellm")
 
 
+# ── Embedding model selection (cloud vs local) ─────────────────────────────
+# Presets the /embedding command offers. Each: (provider, model, dimensions,
+# endpoint). The embedding model is independent of the chat model (OMNI_MODEL)
+# because its vector dimension must stay stable across the indexed store.
+EMBEDDING_PRESETS = {
+    # Cloud: Google Vertex text-embedding-004 (768 dims). Uses your Vertex creds.
+    "cloud":  ("custom", "vertex_ai/text-embedding-004", 768, ""),
+    # Local: fastembed runs a small sentence-transformers model on CPU, fully
+    # offline, no server (requires the 'fastembed' package).
+    "local":  ("fastembed", "BAAI/bge-small-en-v1.5", 384, ""),
+    # Local via Ollama (needs 'ollama serve' + 'ollama pull nomic-embed-text').
+    "ollama": ("ollama", "nomic-embed-text", 768, "http://localhost:11434"),
+}
+
+
+def get_embedding_info() -> tuple[str, str, str]:
+    """Return the currently-configured (provider, model, dimensions)."""
+    return (
+        os.environ.get("EMBEDDING_PROVIDER", "") or "",
+        os.environ.get("EMBEDDING_MODEL", "") or "",
+        os.environ.get("EMBEDDING_DIMENSIONS", "") or "",
+    )
+
+
+def set_embedding(provider: str, model: str, dimensions, endpoint: str = "",
+                  persist: bool = True) -> None:
+    """Set the embedding provider/model/dimensions in env (and persist to .env)."""
+    os.environ["EMBEDDING_PROVIDER"] = provider
+    os.environ["EMBEDDING_MODEL"] = model
+    os.environ["EMBEDDING_DIMENSIONS"] = str(dimensions)
+    if endpoint:
+        os.environ["EMBEDDING_ENDPOINT"] = endpoint
+    if persist:
+        try:
+            from dotenv import set_key
+            envp = os.path.join(PROJECT_ROOT, ".env")
+            set_key(envp, "EMBEDDING_PROVIDER", provider)
+            set_key(envp, "EMBEDDING_MODEL", model)
+            set_key(envp, "EMBEDDING_DIMENSIONS", str(dimensions))
+            if endpoint:
+                set_key(envp, "EMBEDDING_ENDPOINT", endpoint)
+        except Exception:
+            pass
+
+
+def backup_databases(label: str = "") -> str:
+    """Move the Cognee vector/graph DB aside so a fresh store is built with the
+    new embedding dimensions. Returns the backup path (or "" if nothing moved).
+
+    The SimpleMemory JSON store is a separate file and is NOT affected, so facts
+    saved via `remember` survive an embedding switch.
+    """
+    import shutil
+    import time as _t
+    db = os.path.join(COGNEE_SYSTEM_DIR, "databases")
+    if not os.path.isdir(db):
+        return ""
+    tag = label or "switch"
+    dest = os.path.join(COGNEE_SYSTEM_DIR, f"databases_backup_{tag}_{_t.strftime('%Y%m%d_%H%M%S')}")
+    try:
+        shutil.move(db, dest)
+        return dest
+    except Exception:
+        return ""
+
+
 # IMPORTANT ORDERING: set the LLM/embedding env FIRST, because Cognee caches its
 # config (lru_cache) the moment it is imported. configure_cognee_storage() below
 # imports cognee, so the LLM env must already be in place before that happens.
