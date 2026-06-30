@@ -440,61 +440,36 @@ def tool_activity_indent(activity: Text, console: Optional[Console] = None) -> T
 # ─────────────────────────────────────────────────────────────────────────────
 # Banner
 # ─────────────────────────────────────────────────────────────────────────────
-# A compact block-letter font (5 rows tall) used to render "OMNI-DEV" clearly at
-# startup. Uses plain ASCII '#' characters (classic ASCII-art look). Assembled
-# column-by-column so the letters always stay aligned.
-_BANNER_FONT: dict[str, tuple[str, str, str, str, str]] = {
-    "O": ("#####", "#   #", "#   #", "#   #", "#####"),
-    "M": ("#   #", "## ##", "# # #", "#   #", "#   #"),
-    "N": ("#   #", "##  #", "# # #", "#  ##", "#   #"),
-    "I": ("#####", "  #  ", "  #  ", "  #  ", "#####"),
-    "-": ("     ", "     ", " ### ", "     ", "     "),
-    "D": ("#### ", "#   #", "#   #", "#   #", "#### "),
-    "E": ("#####", "#    ", "###  ", "#    ", "#####"),
-    "V": ("#   #", "#   #", "#   #", " # # ", "  #  "),
-}
-
-
-def _ascii_word(word: str) -> list[str]:
-    """Render ``word`` as 5 rows of block letters using :data:`_BANNER_FONT`."""
-    rows = ["", "", "", "", ""]
-    for ch in word.upper():
-        glyph = _BANNER_FONT.get(ch)
-        if glyph is None:
-            glyph = ("     ",) * 5
-        for i in range(5):
-            rows[i] += glyph[i] + " "
-    return [r.rstrip() for r in rows]
+# OMNI-DEV wordmark in the "ANSI Shadow" figlet font (Claude-Code-style logo).
+# Pre-rendered and embedded so there is no runtime figlet dependency.
+_LOGO_ART = (
+    " ██████╗ ███╗   ███╗███╗   ██╗██╗      ██████╗ ███████╗██╗   ██╗",
+    "██╔═══██╗████╗ ████║████╗  ██║██║      ██╔══██╗██╔════╝██║   ██║",
+    "██║   ██║██╔████╔██║██╔██╗ ██║██║█████╗██║  ██║█████╗  ██║   ██║",
+    "██║   ██║██║╚██╔╝██║██║╚██╗██║██║╚════╝██║  ██║██╔══╝  ╚██╗ ██╔╝",
+    "╚██████╔╝██║ ╚═╝ ██║██║ ╚████║██║      ██████╔╝███████╗ ╚████╔╝ ",
+    " ╚═════╝ ╚═╝     ╚═╝╚═╝  ╚═══╝╚═╝      ╚═════╝ ╚══════╝  ╚═══╝  ",
+)
 
 
 def banner(subtitle: str = "agentic coding companion · memory that never forgets",
            console: Optional[Console] = None) -> RenderableType:
-    """Return a Claude-Code-style welcome box: a sparkle + title and a couple of
-    tip lines inside a rounded panel, styled with the red accent.
+    """Render the OMNI-DEV wordmark as an ANSI-Shadow ASCII logo (Claude-Code
+    style), in red, followed by the tagline, tips, and cwd.
 
-    Rendered once at startup and on ``/clear``.
+    Falls back to a plain bold ``OMNI-DEV`` on legacy/ASCII terminals where the
+    box-drawing glyphs in the logo won't render.
     """
-    from rich.panel import Panel
-    from rich.box import ROUNDED, ASCII as ASCII_BOX
-
-    ascii_mode = should_use_ascii(console)
-    spark = "*" if ascii_mode else "\u273b"   # ✻
-    box = ASCII_BOX if ascii_mode else ROUNDED
-
     try:
         cwd = os.getcwd()
     except Exception:
         cwd = "."
 
-    title = Text()
-    title.append(f"{spark} ", style="app.banner")
-    title.append("Welcome to Omni-Dev", style="bold #E5484D")
-
     tip = Text()
     tip.append("/help", style="app.accent")
-    tip.append(" for commands  ", style="app.muted")
+    tip.append(" for commands   ", style="app.muted")
     tip.append("/model", style="app.accent")
-    tip.append(" to switch model  ", style="app.muted")
+    tip.append(" to switch model   ", style="app.muted")
     tip.append("?", style="app.accent")
     tip.append(" for shortcuts", style="app.muted")
 
@@ -502,20 +477,24 @@ def banner(subtitle: str = "agentic coding companion · memory that never forget
     cwd_line.append("cwd: ", style="app.muted")
     cwd_line.append(cwd, style="app.muted")
 
-    body = Group(
-        title,
+    if should_use_ascii(console):
+        return Group(
+            Text("OMNI-DEV", style="app.banner"),
+            Text(""),
+            Text(subtitle, style="app.muted"),
+            Text(""),
+            tip,
+            cwd_line,
+        )
+
+    logo_lines = [Text(row, style="app.banner") for row in _LOGO_ART]
+    return Group(
+        *logo_lines,
         Text(""),
         Text(subtitle, style="app.muted"),
         Text(""),
         tip,
         cwd_line,
-    )
-    return Panel(
-        body,
-        box=box,
-        border_style="app.accent",
-        padding=(0, 2),
-        expand=False,
     )
 
 
