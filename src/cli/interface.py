@@ -961,7 +961,7 @@ async def main():
             ]
 
         ptk_style = Style.from_dict({
-            "prompt": "#7C9CF0 bold",
+            "prompt": "#E5484D bold",
             # Footer: disable the default reversed bar so it blends with the theme.
             "bottom-toolbar": "noreverse bg:default",
             "tb.rule": "#3a3f4b",
@@ -971,11 +971,11 @@ async def main():
             # Slash-command menu.
             "completion-menu": "bg:default",
             "completion-menu.completion": "bg:default #c8ccd4",
-            "completion-menu.completion.current": "bg:#2a2f3a #ffffff",
-            "cmd": "#7C9CF0",
+            "completion-menu.completion.current": "bg:#3a1f22 #ffffff",
+            "cmd": "#E5484D",
             "desc": "#6b7280",
             "scrollbar.background": "bg:#1a1a1a",
-            "scrollbar.button": "bg:#3a3f4b",
+            "scrollbar.button": "bg:#5a2a2e",
         })
 
         completer = SlashCommandCompleter(commands_list)

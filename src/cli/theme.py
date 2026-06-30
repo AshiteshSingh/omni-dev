@@ -38,11 +38,11 @@ from rich.theme import Theme
 # palette: one accent, a muted secondary, and semantic success/warn/error.
 OMNI_THEME = Theme(
     {
-        "app.banner": "bold #7C9CF0",
-        "app.accent": "#7C9CF0",          # primary accent (assistant)
+        "app.banner": "bold #E5484D",
+        "app.accent": "#E5484D",          # primary accent (assistant)
         "app.muted": "dim #8A8F98",       # secondary text, separators
         "user.gutter": "#5A6270",
-        "assistant.gutter": "#7C9CF0",
+        "assistant.gutter": "#E5484D",
         "tool.run": "#E2B341",            # command/run activity
         "tool.read": "#56B6C2",           # read activity
         "tool.edit": "#C586C0",           # edit/write activity
@@ -441,16 +441,17 @@ def tool_activity_indent(activity: Text, console: Optional[Console] = None) -> T
 # Banner
 # ─────────────────────────────────────────────────────────────────────────────
 # A compact block-letter font (5 rows tall) used to render "OMNI-DEV" clearly at
-# startup. Assembled column-by-column so the letters always stay aligned.
+# startup. Uses plain ASCII '#' characters (classic ASCII-art look). Assembled
+# column-by-column so the letters always stay aligned.
 _BANNER_FONT: dict[str, tuple[str, str, str, str, str]] = {
-    "O": ("█████", "█   █", "█   █", "█   █", "█████"),
-    "M": ("█   █", "██ ██", "█ █ █", "█   █", "█   █"),
-    "N": ("█   █", "██  █", "█ █ █", "█  ██", "█   █"),
-    "I": ("█████", "  █  ", "  █  ", "  █  ", "█████"),
-    "-": ("     ", "     ", " ███ ", "     ", "     "),
-    "D": ("████ ", "█   █", "█   █", "█   █", "████ "),
-    "E": ("█████", "█    ", "███  ", "█    ", "█████"),
-    "V": ("█   █", "█   █", "█   █", " █ █ ", "  █  "),
+    "O": ("#####", "#   #", "#   #", "#   #", "#####"),
+    "M": ("#   #", "## ##", "# # #", "#   #", "#   #"),
+    "N": ("#   #", "##  #", "# # #", "#  ##", "#   #"),
+    "I": ("#####", "  #  ", "  #  ", "  #  ", "#####"),
+    "-": ("     ", "     ", " ### ", "     ", "     "),
+    "D": ("#### ", "#   #", "#   #", "#   #", "#### "),
+    "E": ("#####", "#    ", "###  ", "#    ", "#####"),
+    "V": ("#   #", "#   #", "#   #", " # # ", "  #  "),
 }
 
 
