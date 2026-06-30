@@ -972,11 +972,12 @@ async def main():
             "tb.pad": "",
             "tb.model": "#8A8F98",
             # Slash-command menu: command WHITE by default, RED when selected,
-            # with NO full-width highlight bar (bg stays default) — the selection
-            # color reflects only on the command text, not the whole row.
+            # with NO full-width highlight bar. 'noreverse' stops prompt_toolkit
+            # from inverting the selected row (which turned the red text into a
+            # red background). The description keeps its own grey style unchanged.
             "completion-menu": "bg:default",
-            "completion-menu.completion": "bg:default #ffffff",
-            "completion-menu.completion.current": "bg:default #E5484D bold",
+            "completion-menu.completion": "bg:default #ffffff noreverse",
+            "completion-menu.completion.current": "bg:default #E5484D bold noreverse",
             "desc": "#6b7280",
             "scrollbar.background": "bg:#1a1a1a",
             "scrollbar.button": "bg:#5a2a2e",
