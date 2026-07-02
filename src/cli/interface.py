@@ -1750,6 +1750,27 @@ async def main():
 # ─────────────────────────────────────────────────────────────────────────────
 # Task execution + budget helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _safe_set_env_key(key: str, value: str) -> None:
+    """Safely update .env without using dotenv.set_key directly if unwritable.
+    
+    Python's tempfile.NamedTemporaryFile (used by dotenv on Windows) contains a bug 
+    where it infinitely loops trying to create a file if os.access passes but 
+    os.open throws PermissionError (e.g. in C:\WINDOWS\System32).
+    By testing open() first, we bypass the bug and fail instantly instead of hanging.
+    """
+    try:
+        with open(".env", "a", encoding="utf-8"):
+            pass
+    except Exception:
+        return
+
+    try:
+        from dotenv import set_key
+        set_key(".env", key, value)
+    except Exception:
+        pass
+
 def render_task_result(agent, final_response):
     """Render a task result like the main REPL turn: skip a second render if the
     stream hook already showed it, else render the markdown."""
@@ -2002,11 +2023,7 @@ async def handle_model_command(user_input, session, use_prompt_toolkit):
         return
 
     os.environ["OMNI_MODEL"] = canonical
-    try:
-        from dotenv import set_key
-        set_key(".env", "OMNI_MODEL", canonical)
-    except Exception:
-        pass
+    _safe_set_env_key("OMNI_MODEL", canonical)
 
     decision = model_router.route(canonical, os.environ)
 
@@ -2015,11 +2032,7 @@ async def handle_model_command(user_input, session, use_prompt_toolkit):
         base = os.environ.get("OLLAMA_API_BASE")
         if not base or base == "http://localhost:11434":
             os.environ["OLLAMA_API_BASE"] = "https://ollama.com"
-            try:
-                from dotenv import set_key
-                set_key(".env", "OLLAMA_API_BASE", "https://ollama.com")
-            except Exception:
-                pass
+            _safe_set_env_key("OLLAMA_API_BASE", "https://ollama.com")
             decision = model_router.route(canonical, os.environ)
 
     console.print(f"  [status.ok]Model switched to:[/status.ok] {decision.canonical_model}")
@@ -2087,16 +2100,8 @@ async def handle_api_key_command(user_input, session, use_prompt_toolkit):
             if "cloud" in current and "ollama" in current:
                 if not os.environ.get("OLLAMA_API_BASE") or os.environ.get("OLLAMA_API_BASE") == "http://localhost:11434":
                     os.environ["OLLAMA_API_BASE"] = "https://ollama.com"
-                    try:
-                        from dotenv import set_key
-                        set_key(".env", "OLLAMA_API_BASE", "https://ollama.com")
-                    except Exception:
-                        pass
-        try:
-            from dotenv import set_key
-            set_key(".env", provider_key, key_value)
-        except Exception:
-            pass
+                    _safe_set_env_key("OLLAMA_API_BASE", "https://ollama.com")
+        _safe_set_env_key(provider_key, key_value)
         _run_cognee_sync_in_background()
         console.print(f"  [status.ok]API key saved:[/status.ok] {provider_key}")
 
