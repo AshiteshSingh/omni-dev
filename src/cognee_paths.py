@@ -40,10 +40,8 @@ os.environ.setdefault("LITELLM_SET_VERBOSE", "False")
 # itself; doing it here covers subagents, tools and scripts too).
 os.environ.setdefault("COGNEE_SKIP_CONNECTION_TEST", "true")
 
-# Project root = two levels up from this file (src/cognee_paths.py -> project/).
-PROJECT_ROOT = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-)
+# Project root = the directory where the user invoked the CLI (their repo).
+PROJECT_ROOT = os.path.abspath(os.getcwd())
 COGNEE_DATA_DIR = os.path.join(PROJECT_ROOT, ".cognee_data")
 COGNEE_SYSTEM_DIR = os.path.join(COGNEE_DATA_DIR, "system")
 
