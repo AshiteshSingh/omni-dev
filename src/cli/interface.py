@@ -436,18 +436,32 @@ def _permission_target(tool_name: str, args: dict) -> str:
     return str(args.get("file_path") or args.get("path") or "")
 
 
-def _ask_permission_choice() -> str:
-    """Blocking permission prompt. Returns 'once', 'always', or 'deny'."""
-    from rich.prompt import Prompt
+async def _ask_permission_choice_async() -> str:
+    """Non-blocking permission prompt. Returns 'once', 'always', or 'deny'."""
     try:
-        choice = Prompt.ask(
-            "Allow this action? [1] once  [2] always  [3] deny",
-            choices=["1", "2", "3"],
-            default="1",
+        from prompt_toolkit import PromptSession
+        temp_session = PromptSession()
+        ans = await temp_session.prompt_async("Allow this action? [1] once  [2] always  [3] deny [1/2/3] (1): ")
+        ans = (ans or "").strip()
+        if not ans:
+            ans = "1"
+        return {"1": "once", "2": "always", "3": "deny"}.get(ans, "deny")
+    except Exception:
+        pass
+
+    from rich.prompt import Prompt as RPrompt
+    import asyncio
+    try:
+        ans = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: RPrompt.ask(
+                "Allow this action? [1] once  [2] always  [3] deny",
+                choices=["1", "2", "3"],
+                default="1",
+            )
         )
     except (EOFError, KeyboardInterrupt):
         return "deny"
-    return {"1": "once", "2": "always", "3": "deny"}.get(choice, "deny")
+    return {"1": "once", "2": "always", "3": "deny"}.get(ans, "deny")
 
 
 def make_permission_callback(agent, ui_state):
@@ -491,7 +505,7 @@ def make_permission_callback(agent, ui_state):
                 Panel(body, title=Text("Permission required", style="status.warn"),
                       border_style="status.warn", padding=(0, 1))
             )
-            choice = await asyncio.get_event_loop().run_in_executor(None, _ask_permission_choice)
+            choice = await _ask_permission_choice_async()
         finally:
             if status:
                 try:
